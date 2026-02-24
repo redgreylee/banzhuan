@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>跨所套利监控 - 实时仪表盘</title>
+  <style>
+    :root {
+      --bg: #0f0f17;
+      --text: #e0e0ff;
+      --card: #1a1a2e;
+      --green: #00ff9d;
+      --red: #ff4d6a;
+      --gray: #8899aa;
+    }
+    body {
+      margin: 0;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 20px;
+      box-sizing: border-box;
+    }
+    header {
+      text-align: center;
+      margin-bottom: 30px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 2.4rem;
+      background: linear-gradient(90deg, #00ff9d, #00d4ff);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .stats {
+      display: flex;
+      justify-content: center;
+      gap: 40px;
+      margin: 20px 0;
+      color: var(--gray);
+    }
+    .card {
+      background: var(--card);
+      border-radius: 12px;
+      padding: 20px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+      margin-bottom: 20px;
+      max-width: 900px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    th, td {
+      padding: 14px 10px;
+      text-align: left;
+      border-bottom: 1px solid #2a2a40;
+    }
+    th {
+      color: var(--gray);
+      font-weight: normal;
+      text-transform: uppercase;
+      font-size: 0.82rem;
+    }
+    .profit {
+      color: var(--green);
+      font-weight: bold;
+      font-size: 1.1rem;
+    }
+    .time {
+      color: var(--gray);
+      font-size: 0.85rem;
+    }
+    .symbol {
+      font-weight: 600;
+      color: white;
+    }
+    .highlight {
+      animation: flash 1.5s 2;
+    }
+    @keyframes flash {
+      0%,100% { background: transparent; }
+      50% { background: rgba(0,255,157,0.12); }
+    }
+    .empty {
+      text-align: center;
+      color: var(--gray);
+      padding: 60px 0;
+      font-size: 1.1rem;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>跨所套利实时监控</h1>
+  <div class="stats">
+    <div>已发现机会: <strong id="opp-count">0</strong></div>
+    <div>监控交易所: <strong id="exchanges">加载中...</strong></div>
+    <div>监控币种: <strong id="symbols">加载中...</strong></div>
+  </div>
+</header>
+
+<div class="card">
+  <table id="arb-table">
+    <thead>
+      <tr>
+        <th>时间</th>
+        <th>币对</th>
+        <th>买入所</th>
+        <th>卖出所</th>
+        <th>净利</th>
+        <th>买价 / 卖价</th>
+        <th>差价</th>
+      </tr>
+    </thead>
+    <tbody id="arb-body"></tbody>
+  </table>
+
+  <div id="empty-msg" class="empty" style="display:none;">暂无达到阈值的套利机会...</div>
+</div>
+
+<script>
+// ======================== 配置 ========================
+const WS_URL = 'ws://127.0.0.1:8765';   // ← 改成你后端的WebSocket地址
+
+// ======================== 主逻辑 ========================
+const oppCountEl = document.getElementById('opp-count');
+const tbody = document.getElementById('arb-body');
+const emptyMsg = document.getElementById('empty-msg');
+
+let oppCount = 0;
+
+function formatNumber(num, digits = 4) {
+  return Number(num).toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+
+function addOpportunity(data) {
+  oppCount++;
+  oppCountEl.textContent = oppCount;
+
+  const row = document.createElement('tr');
+  row.className = 'highlight';
+
+  row.innerHTML = `
+    <td class="time">${new Date().toLocaleTimeString()}</td>
+    <td class="symbol">${data.symbol}</td>
+    <td>${data.buy_ex}</td>
+    <td>${data.sell_ex}</td>
+    <td class="profit">${data.net_profit.toFixed(2)}%</td>
+    <td>${formatNumber(data.buy_price)} / ${formatNumber(data.sell_price)}</td>
+    <td>${(data.sell_price - data.buy_price).toFixed(6)}</td>
+  `;
+
+  tbody.insertBefore(row, tbody.firstChild);
+
+  // 最多保留100条，防止卡顿
+  if (tbody.children.length > 100) {
+    tbody.removeChild(tbody.lastChild);
+  }
+
+  emptyMsg.style.display = 'none';
+}
+
+// WebSocket 连接
+const ws = new WebSocket(WS_URL);
+
+ws.onopen = () => {
+  console.log('WebSocket 已连接');
+  document.querySelector('h1').style.opacity = '1';
+};
+
+ws.onmessage = (event) => {
+  try {
+    const msg = JSON.parse(event.data);
+    if (msg.type === 'arbitrage') {
+      addOpportunity(msg.data);
+    } else if (msg.type === 'init') {
+      document.getElementById('exchanges').textContent = msg.exchanges.join(', ');
+      document.getElementById('symbols').textContent = msg.symbol_count;
+    }
+  } catch(e) {
+    console.error('解析错误:', e);
+  }
+};
+
+ws.onclose = () => {
+  console.warn('WebSocket 断开，10秒后重连...');
+  setTimeout(() => location.reload(), 10000);
+};
+
+ws.onerror = (err) => {
+  console.error('WebSocket 错误:', err);
+};
+</script>
+
+</body>
+</html>
