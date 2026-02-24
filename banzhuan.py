@@ -4,14 +4,30 @@ import ccxt
 import time
 import logging
 from collections import defaultdict
+from logging.handlers import TimedRotatingFileHandler   # 新增：用于日志轮转
 
-# --- 1. 日志配置 ---
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%H:%M:%S'
-)
+# --- 1. 日志配置（同时输出到控制台和文件，每日轮转）---
 logger = logging.getLogger("ArbBot")
+logger.setLevel(logging.INFO)
+
+# 日志格式
+formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
+
+# 文件 Handler：每天轮转，保留7天
+file_handler = TimedRotatingFileHandler(
+    'arbitrage.log',
+    when='midnight',
+    interval=1,
+    backupCount=7,
+    encoding='utf-8'
+)
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+# 控制台 Handler
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
 
 # --- 2. 核心配置区 ---
 # 交易所列表
@@ -22,7 +38,7 @@ EXCHANGE_IDS = ['binance', 'okx', 'bybit', 'gate', 'kucoin', 'mexc', 'bitget']
 PROXY_URL = 'http://127.0.0.1:7890' 
 
 # 阈值设置
-PROFIT_THRESHOLD = 0.6     # 净利润阈值 (%)，达到此值才打印日志
+PROFIT_THRESHOLD = 2     # 净利润阈值 (%)，达到此值才打印日志
 TAKER_FEE_RATE = 0.002     # 预估单边手续费 (0.2%)
 MAX_TIME_DIFF_MS = 3000    # 价格有效时间窗口 (3秒)，超过此时间差不比价
 REST_POLL_INTERVAL = 2.0   # 轮询模式下的休眠间隔 (秒)
