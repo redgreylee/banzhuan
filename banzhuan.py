@@ -1,168 +1,252 @@
 import asyncio
 import ccxt.pro as ccxtpro
+import ccxt
 import time
 import logging
+from collections import defaultdict
 
-# --- 日志配置 ---
+# --- 1. 日志配置 ---
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO, 
     format='%(asctime)s [%(levelname)s] %(message)s',
     datefmt='%H:%M:%S'
 )
-logger = logging.getLogger("GlobalArbitrage")
+logger = logging.getLogger("ArbBot")
 
-# --- 配置区 ---
-PROXY_URL = 'http://127.0.0.1:7890' # 若在海外服务器请设为 None
-PROFIT_THRESHOLD = 0.2              # 目标净利润阈值 (%)
-TAKER_FEE_RATE = 0.001              # 默认 Taker 手续费 0.1%
-MAX_TIME_DIFF = 2000                # 最大允许两端数据时间差 (ms)
-MIN_24H_VOLUME = 500000             # 过滤 24h 成交额低于 50w USDT 的币种
+# --- 2. 核心配置区 ---
+# 交易所列表
+EXCHANGE_IDS = ['binance', 'okx', 'bybit', 'gate', 'kucoin', 'mexc', 'bitget']
+
+# 代理设置 (国内环境必须配置，否则无法连接)
+# 如果使用 V2RayN/Clash，通常是 127.0.0.1:7890 或 10809
+PROXY_URL = 'http://127.0.0.1:7890' 
+
+# 阈值设置
+PROFIT_THRESHOLD = 0.6     # 净利润阈值 (%)，达到此值才打印日志
+TAKER_FEE_RATE = 0.002     # 预估单边手续费 (0.2%)
+MAX_TIME_DIFF_MS = 3000    # 价格有效时间窗口 (3秒)，超过此时间差不比价
+REST_POLL_INTERVAL = 2.0   # 轮询模式下的休眠间隔 (秒)
 
 class GlobalArbitrageMonitor:
     def __init__(self):
-        # 交易所基础配置
-        self.exchange_config = {
+        self.exchanges = {}
+        # 数据结构: { symbol: { exchange_id: {bid, ask, ts} } }
+        self.price_data = defaultdict(dict)
+        self.target_symbols = set() # 使用 Set 提高查找速度
+        self.opp_count = 0
+
+    async def init_exchanges(self):
+        """初始化连接并计算共同交易对"""
+        base_config = {
             'enableRateLimit': True,
-            'options': {'defaultType': 'spot'} 
+            'options': {
+                'defaultType': 'spot', 
+                'warnOnFetchOpenOrdersWithoutSymbol': False
+            },
+            # 某些交易所全量订阅需要此配置以保持稳定性
+            'newUpdates': False, 
+            'timeout': 20000,
         }
-        if PROXY_URL:
-            self.exchange_config['aiohttp_proxy'] = PROXY_URL
-            self.exchange_config['wsProxy'] = PROXY_URL
-
-        self.binance = ccxtpro.binance(self.exchange_config)
-        self.okx = ccxtpro.okx(self.exchange_config)
         
-        # 数据结构: { symbol: { 'binance': {...}, 'okx': {...} } }
-        self.price_data = {}
-        self.common_symbols = []
+        # 配置代理
+        if PROXY_URL:
+            base_config['aiohttp_proxy'] = PROXY_URL
+            base_config['wsProxy'] = PROXY_URL
+            base_config['proxies'] = {'http': PROXY_URL, 'https': PROXY_URL}
 
-    async def init_markets(self):
-        """初始化并获取共同的 USDT 现货交易对"""
-        try:
-            logger.info("🔍 正在拉取交易所市场数据...")
-            await asyncio.gather(self.binance.load_markets(), self.okx.load_markets())
-            
-            # 获取交集：两边都有的 USDT 现货对
-            bn_syms = {s for s in self.binance.symbols if s.endswith('/USDT') and ':' not in s}
-            ok_syms = {s for s in self.okx.symbols if s.endswith('/USDT') and ':' not in s}
-            
-            self.common_symbols = list(bn_syms.intersection(ok_syms))
-            logger.info(f"✅ 初始化完成。共同 USDT 现货交易对数量: {len(self.common_symbols)}")
-            return True
-        except Exception as e:
-            logger.error(f"❌ 市场初始化失败: {e}")
+        logger.info(f"🔌 正在连接 {len(EXCHANGE_IDS)} 个交易所...")
+        
+        # 并行加载市场
+        tasks = [self._load_exchange(eid, base_config) for eid in EXCHANGE_IDS]
+        await asyncio.gather(*tasks)
+
+        # --- 核心逻辑：筛选共同币种 ---
+        # 统计每个币种在多少个交易所上线
+        symbol_counter = defaultdict(int)
+        valid_exchanges = 0
+        
+        for eid, ex in self.exchanges.items():
+            if not ex.markets: continue
+            valid_exchanges += 1
+            for symbol in ex.markets:
+                market = ex.markets[symbol]
+                # 只监控现货且活跃的 USDT 交易对
+                if market.get('spot') and symbol.endswith('/USDT') and market.get('active'):
+                    symbol_counter[symbol] += 1
+        
+        # 只要在 >= 2 个交易所存在，就纳入监控
+        self.target_symbols = {s for s, c in symbol_counter.items() if c >= 2}
+        
+        if not self.target_symbols:
+            logger.error("❌ 未找到共同交易对，请检查网络或代理！")
             return False
 
-    async def watch_exchange_tickers(self, exchange, exchange_name):
+        logger.info(f"✅ 初始化完成 | 有效交易所: {valid_exchanges} | 监控币种: {len(self.target_symbols)} 个")
+        return True
+
+    async def _load_exchange(self, eid, config):
+        try:
+            ex_class = getattr(ccxtpro, eid)
+            exchange = ex_class(config)
+            await exchange.load_markets()
+            self.exchanges[eid] = exchange
+            logger.info(f"🟢 {eid} 就绪")
+        except Exception as e:
+            logger.error(f"🔴 {eid} 初始化失败: {e}")
+
+    async def watch_tickers_loop(self, eid):
         """
-        全量监听 Ticker 更新
+        核心循环：使用 'Watch All' 模式避免参数过长报错
         """
-        if not self.common_symbols:
+        ex = self.exchanges[eid]
+        
+        # 计算该交易所实际上线了我们目标清单里的哪些币
+        # 用于后续过滤数据
+        relevant_symbols = {s for s in self.target_symbols if s in ex.markets}
+        if not relevant_symbols:
             return
 
-        logger.info(f"📡 启动 {exchange_name} WebSocket 监听...")
+        # 默认为 False，尝试使用 WebSocket
+        use_rest_mode = False
         
+        # MEXC 已知不支持 Spot WebSocket 批量，直接切 REST
+        if eid == 'mexc':
+            use_rest_mode = True
+            logger.info(f"ℹ️  [{eid}] 已知不支持 WS 批量，默认使用 REST 轮询")
+        else:
+            logger.info(f"📡 [{eid}] 启动全量监控 (Watch All) ...")
+
         while True:
             try:
-                # 传入 common_symbols 列表，解决 OKX 不支持空列表订阅的问题
-                # CCXT Pro 会自动处理分片订阅
-                tickers = await exchange.watch_tickers(self.common_symbols)
+                tickers = {}
                 
-                for symbol, ticker in tickers.items():
-                    # 只处理我们关心的共同币种
-                    if symbol not in self.common_symbols:
-                        continue
+                # --- 分支 A: REST 轮询模式 ---
+                if use_rest_mode:
+                    # 获取所有 tickers，避免 URL 过长
+                    tickers = await ex.fetch_tickers() 
+                    await asyncio.sleep(REST_POLL_INTERVAL)
 
-                    # 24小时成交额过滤（低流动性币种的价差通常无法成交）
-                    if ticker.get('quoteVolume') and ticker['quoteVolume'] < MIN_24H_VOLUME:
-                        continue
+                # --- 分支 B: WebSocket 实时模式 ---
+                else:
+                    try:
+                        # 关键修改：不传参数！订阅全市场！
+                        # 解决 Bybit args > 10 和 KuCoin URL invalid 问题
+                        tickers = await ex.watch_tickers()
+                        
+                    except (ccxt.NotSupported, ccxt.ExchangeError, ccxt.BadRequest) as e:
+                        # 如果全量订阅报错，降级到 REST
+                        err_str = str(e).lower()
+                        if "support" in err_str or "method" in err_str:
+                            logger.warning(f"⚠️ [{eid}] WS 全量订阅不可用，降级为 REST: {e}")
+                            use_rest_mode = True
+                            continue
+                        else:
+                            raise e
 
-                    if symbol not in self.price_data:
-                        self.price_data[symbol] = {}
-
-                    # 填充数据
-                    self.price_data[symbol][exchange_name] = {
-                        'bid': ticker['bid'],
-                        'ask': ticker['ask'],
-                        'ts': ticker['timestamp'] or int(time.time() * 1000)
-                    }
-                    
-                    # 尝试计算收益
-                    self.check_profit(symbol)
+                # --- 数据处理 ---
+                self.process_data(eid, tickers, relevant_symbols)
 
             except Exception as e:
-                logger.warning(f"⚠️ {exchange_name} WS 异常: {e}，5秒后重连...")
-                await asyncio.sleep(5)
+                err_msg = str(e)
+                if "support" in err_msg.lower() and not use_rest_mode:
+                     use_rest_mode = True
+                else:
+                    # 避免日志刷屏，只记录简短错误
+                    logger.warning(f"⚠️ [{eid}] 连接抖动: {err_msg[:50]}... 5秒后重连")
+                    await asyncio.sleep(5)
 
-    def check_profit(self, symbol):
-        """
-        核心套利计算逻辑
-        收益率公式:
-        $$Profit = \frac{Price_{sell} \times (1 - Fee)}{Price_{buy} \times (1 + Fee)} - 1$$
-        """
-        data = self.price_data.get(symbol)
-        if not data or 'binance' not in data or 'okx' not in data:
-            return
-
-        bn = data['binance']
-        ok = data['okx']
-
-        # 确保价格数据完整
-        if not (bn['bid'] and bn['ask'] and ok['bid'] and ok['ask']):
-            return
+    def process_data(self, eid, tickers, relevant_symbols):
+        """处理并过滤行情数据"""
+        current_ts = time.time() * 1000
+        
+        for symbol, ticker in tickers.items():
+            # ⚡ 极速过滤：只处理我们在乎的币种
+            if symbol not in relevant_symbols: 
+                continue 
             
-        # 校验两端数据的延迟差，防止因为行情卡顿导致的假价差
-        time_diff = abs(bn['ts'] - ok['ts'])
-        if time_diff > MAX_TIME_DIFF:
-            return
+            bid = ticker.get('bid')
+            ask = ticker.get('ask')
+            
+            if not bid or not ask: continue
 
-        # ---------------------------------------------------------
-        # 路径 A: Binance 买 (吃其 Ask), OKX 卖 (砸其 Bid)
-        # ---------------------------------------------------------
-        profit_a = (ok['bid'] * (1 - TAKER_FEE_RATE) / (bn['ask'] * (1 + TAKER_FEE_RATE)) - 1) * 100
-        if profit_a > PROFIT_THRESHOLD:
-            self.log_opportunity("Binance -> OKX", symbol, profit_a, bn['ask'], ok['bid'], time_diff)
+            # 更新内存数据
+            self.price_data[symbol][eid] = {
+                'bid': float(bid),
+                'ask': float(ask),
+                'ts': ticker.get('timestamp') or current_ts
+            }
+            
+            # 触发比价逻辑
+            self.calculate_arbitrage(symbol, trigger_ex=eid)
 
-        # ---------------------------------------------------------
-        # 路径 B: OKX 买 (吃其 Ask), Binance 卖 (砸其 Bid)
-        # ---------------------------------------------------------
-        profit_b = (bn['bid'] * (1 - TAKER_FEE_RATE) / (ok['ask'] * (1 + TAKER_FEE_RATE)) - 1) * 100
-        if profit_b > PROFIT_THRESHOLD:
-            self.log_opportunity("OKX -> Binance", symbol, profit_b, ok['ask'], bn['bid'], time_diff)
+    def calculate_arbitrage(self, symbol, trigger_ex):
+        """O(N) 复杂度的比价逻辑"""
+        platforms = self.price_data.get(symbol)
+        if not platforms or len(platforms) < 2: return
 
-    def log_opportunity(self, direction, symbol, profit, buy_p, sell_p, diff):
-        logger.info(
-            f"💰 [套利机会] {symbol} | {direction}\n"
-            f"   净利润: {profit:.3f}% | 买入: {buy_p} | 卖出: {sell_p} | 延迟: {diff}ms"
-        )
+        trigger_data = platforms[trigger_ex]
+        
+        # 只对比 trigger_ex 和其他交易所
+        for other_ex, other_data in platforms.items():
+            if other_ex == trigger_ex: continue
+
+            # 1. 时间窗口检查 (剔除陈旧数据)
+            time_diff = abs(trigger_data['ts'] - other_data['ts'])
+            if time_diff > MAX_TIME_DIFF_MS:
+                continue
+
+            # 2. 路径 A: Trigger 买 -> Other 卖
+            self.check_profit(trigger_ex, other_ex, symbol, trigger_data['ask'], other_data['bid'])
+            
+            # 3. 路径 B: Other 买 -> Trigger 卖
+            self.check_profit(other_ex, trigger_ex, symbol, other_data['ask'], trigger_data['bid'])
+
+    def check_profit(self, buy_ex, sell_ex, symbol, buy_price, sell_price):
+        if buy_price <= 0: return
+
+        # 净利计算: (卖出所得 - 买入成本) / 买入成本
+        # 卖出所得 = sell_price * (1 - fee)
+        # 买入成本 = buy_price * (1 + fee)
+        
+        net_profit = (sell_price * (1 - TAKER_FEE_RATE) / (buy_price * (1 + TAKER_FEE_RATE)) - 1) * 100
+
+        if net_profit > PROFIT_THRESHOLD:
+            self.opp_count += 1
+            # 简单计算一个毛利给日志看
+            gross = (sell_price - buy_price) / buy_price * 100
+            
+            logger.info(
+                f"🔥 [机会 #{self.opp_count}] {symbol} | "
+                f"{buy_ex} -> {sell_ex}\n"
+                f"   💰 净利: {net_profit:.2f}% (毛利 {gross:.2f}%)\n"
+                f"   🟢 买: {buy_price:<10} 🔴 卖: {sell_price:<10} (差价: {(sell_price-buy_price):.4f})"
+            )
 
     async def run(self):
-        # 1. 第一步：初始化市场并对齐币种
-        success = await self.init_markets()
-        if not success:
-            return
+        if not await self.init_exchanges(): return
 
-        logger.info(f"🚀 策略正式启动 | 阈值: {PROFIT_THRESHOLD}% | 过滤成交额: {MIN_24H_VOLUME} USDT")
+        tasks = [self.watch_tickers_loop(eid) for eid in self.exchanges.keys()]
         
-        # 2. 第二步：并发执行双端监听
+        logger.info("🚀 监控引擎启动... (按 Ctrl+C 停止)")
         try:
-            await asyncio.gather(
-                self.watch_exchange_tickers(self.binance, 'binance'),
-                self.watch_exchange_tickers(self.okx, 'okx')
-            )
+            await asyncio.gather(*tasks)
         except Exception as e:
-            logger.error(f"🔥 系统崩溃: {e}")
+            logger.error(f"主程序错误: {e}")
         finally:
-            await self.close()
+            await self.shutdown()
 
-    async def close(self):
-        logger.info("🔌 正在关闭连接...")
-        await self.binance.close()
-        await self.okx.close()
+    async def shutdown(self):
+        logger.info("正在关闭连接...")
+        for name, ex in self.exchanges.items():
+            await ex.close()
+        logger.info("👋 再见")
 
 if __name__ == "__main__":
     bot = GlobalArbitrageMonitor()
     try:
+        # Windows Python 3.8+ 兼容性设置
+        if hasattr(asyncio, 'WindowsSelectorEventLoopPolicy'):
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         asyncio.run(bot.run())
     except KeyboardInterrupt:
-        logger.info("\n👋 用户手动停止。")
+        pass
