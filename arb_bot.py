@@ -200,6 +200,14 @@ class GlobalArbitrageMonitor:
         buy_data = platforms.get(buy_ex, {})
         sell_data = platforms.get(sell_ex, {})
 
+        # 新增：过滤 24h 交易量为 0 或低于阈值的情况
+        buy_vol_24h = buy_data.get('quoteVolume', 0)
+        sell_vol_24h = sell_data.get('quoteVolume', 0)
+
+        if buy_vol_24h == 0 or sell_vol_24h == 0 or \
+           buy_vol_24h < MIN_QUOTE_VOLUME or sell_vol_24h < MIN_QUOTE_VOLUME:
+            return
+
         buy_vol = buy_data.get('askVol')
         sell_vol = sell_data.get('bidVol')
         buy_depth_usdt = buy_vol * buy_price if buy_vol is not None else 0
