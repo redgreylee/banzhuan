@@ -4,86 +4,93 @@ import ccxt
 import time
 import logging
 from collections import defaultdict
-import websockets
-import json
-from websockets.protocol import State  # 新增导入，用于状态检查
+from logging.handlers import TimedRotatingFileHandler
 
-# --- 1. 日志配置 ---
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%H:%M:%S'
-)
+# 新增：Web面板依赖
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+import uvicorn
+import threading
+
+# --- 1. 日志配置（控制台 + 每日轮转文件）---
 logger = logging.getLogger("ArbBot")
+logger.setLevel(logging.INFO)
+
+formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
+
+file_handler = TimedRotatingFileHandler(
+    'arbitrage.log',
+    when='midnight',
+    interval=1,
+    backupCount=7,
+    encoding='utf-8'
+)
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
 
 # --- 2. 核心配置区 ---
-# 交易所列表
 EXCHANGE_IDS = ['binance', 'okx', 'bybit', 'gate', 'kucoin', 'mexc', 'bitget']
 
-# 代理设置 (国内环境必须配置，否则无法连接)
-# 如果使用 V2RayN/Clash，通常是 127.0.0.1:7890 或 10809
-PROXY_URL = 'http://127.0.0.1:7890' 
+PROXY_URL = 'http://127.0.0.1:7890'   # 台湾环境若无需代理请改成 ''
 
-# 阈值设置
-PROFIT_THRESHOLD = 0.6     # 净利润阈值 (%)，达到此值才打印日志
-TAKER_FEE_RATE = 0.002     # 预估单边手续费 (0.2%)
-MAX_TIME_DIFF_MS = 3000    # 价格有效时间窗口 (3秒)，超过此时间差不比价
-REST_POLL_INTERVAL = 2.0   # 轮询模式下的休眠间隔 (秒)
+PROFIT_THRESHOLD = 0.8
+MAX_TIME_DIFF_MS = 3000
+REST_POLL_INTERVAL = 2.0
+
+FEE_RATES = {
+    'binance': 0.0010, 'okx': 0.0010, 'bybit': 0.0010,
+    'gate': 0.0020, 'kucoin': 0.0020, 'mexc': 0.0020,
+    'bitget': 0.0020, 'default': 0.0020
+}
+
+MIN_QUOTE_VOLUME = 50000
+MIN_DEPTH_USDT = 100
+ALERT_COOLDOWN = 60
+
+# 防ticker冲突（同一个符号不同币种）
+MAX_PRICE_RATIO = 10.0
 
 class GlobalArbitrageMonitor:
     def __init__(self):
         self.exchanges = {}
-        # 数据结构: { symbol: { exchange_id: {bid, ask, ts} } }
         self.price_data = defaultdict(dict)
-        self.target_symbols = set() # 使用 Set 提高查找速度
+        self.target_symbols = set()
         self.opp_count = 0
-        self.last_alert = {}  # (symbol, buy_ex, sell_ex) → last_ts，用于日志冷却
-        self.clients = set()  # WebSocket 客户端集合
+        self.last_alert_time = defaultdict(lambda: defaultdict(int))
+        self.recent_opportunities = []   # Web面板用
 
     async def init_exchanges(self):
-        """初始化连接并计算共同交易对"""
         base_config = {
             'enableRateLimit': True,
-            'options': {
-                'defaultType': 'spot', 
-                'warnOnFetchOpenOrdersWithoutSymbol': False
-            },
-            # 某些交易所全量订阅需要此配置以保持稳定性
-            'newUpdates': False, 
+            'options': {'defaultType': 'spot', 'warnOnFetchOpenOrdersWithoutSymbol': False},
+            'newUpdates': False,
             'timeout': 20000,
         }
-        
-        # 配置代理
         if PROXY_URL:
             base_config['aiohttp_proxy'] = PROXY_URL
             base_config['wsProxy'] = PROXY_URL
             base_config['proxies'] = {'http': PROXY_URL, 'https': PROXY_URL}
 
         logger.info(f"🔌 正在连接 {len(EXCHANGE_IDS)} 个交易所...")
-        
-        # 并行加载市场
         tasks = [self._load_exchange(eid, base_config) for eid in EXCHANGE_IDS]
         await asyncio.gather(*tasks)
 
-        # --- 核心逻辑：筛选共同币种 ---
-        # 统计每个币种在多少个交易所上线
         symbol_counter = defaultdict(int)
         valid_exchanges = 0
-        
         for eid, ex in self.exchanges.items():
             if not ex.markets: continue
             valid_exchanges += 1
             for symbol in ex.markets:
                 market = ex.markets[symbol]
-                # 只监控现货且活跃的 USDT 交易对
                 if market.get('spot') and symbol.endswith('/USDT') and market.get('active'):
-                    # 符号规范化
-                    normalized = symbol.upper().replace('-', '/').replace('_', '/')
-                    symbol_counter[normalized] += 1
-        
-        # 只要在 >= 2 个交易所存在，就纳入监控
+                    symbol_counter[symbol] += 1
+
         self.target_symbols = {s for s, c in symbol_counter.items() if c >= 2}
-        
+
         if not self.target_symbols:
             logger.error("❌ 未找到共同交易对，请检查网络或代理！")
             return False
@@ -102,212 +109,256 @@ class GlobalArbitrageMonitor:
             logger.error(f"🔴 {eid} 初始化失败: {e}")
 
     async def watch_tickers_loop(self, eid):
-        """
-        核心循环：使用 'Watch All' 模式避免参数过长报错
-        """
         ex = self.exchanges[eid]
-        
-        # 计算该交易所实际上线了我们目标清单里的哪些币
-        # 用于后续过滤数据
         relevant_symbols = {s for s in self.target_symbols if s in ex.markets}
-        if not relevant_symbols:
-            return
+        if not relevant_symbols: return
 
-        # 默认为 False，尝试使用 WebSocket
-        use_rest_mode = False
-        
-        # MEXC 已知不支持 Spot WebSocket 批量，直接切 REST
-        if eid == 'mexc':
-            use_rest_mode = True
-            logger.info(f"ℹ️  [{eid}] 已知不支持 WS 批量，默认使用 REST 轮询")
-
+        use_rest_mode = (eid == 'mexc')
+        if use_rest_mode:
+            logger.info(f"ℹ️  [{eid}] 使用 REST 轮询模式")
         else:
-            logger.info(f"📡 [{eid}] 启动全量监控 (Watch All) ...")
+            logger.info(f"📡 [{eid}] 启动 WebSocket 全量监控")
 
         while True:
             try:
-                tickers = {}
-                
-                # --- 分支 A: REST 轮询模式 ---
                 if use_rest_mode:
-                    # 获取所有 tickers，避免 URL 过长
-                    tickers = await ex.fetch_tickers() 
-                    # MEXC 单独延长间隔以避免限频
-                    interval = 6.5 if eid == 'mexc' else REST_POLL_INTERVAL
-                    await asyncio.sleep(interval)
-
-                # --- 分支 B: WebSocket 实时模式 ---
+                    tickers = await ex.fetch_tickers()
+                    await asyncio.sleep(REST_POLL_INTERVAL)
                 else:
                     try:
-                        # 关键修改：不传参数！订阅全市场！
-                        # 解决 Bybit args > 10 和 KuCoin URL invalid 问题
                         tickers = await ex.watch_tickers()
-                        
                     except (ccxt.NotSupported, ccxt.ExchangeError, ccxt.BadRequest) as e:
-                        # 如果全量订阅报错，降级到 REST
-                        err_str = str(e).lower()
-                        if "support" in err_str or "method" in err_str:
-                            logger.warning(f"⚠️ [{eid}] WS 全量订阅不可用，降级为 REST: {e}")
+                        if "support" in str(e).lower() or "method" in str(e).lower():
+                            logger.warning(f"⚠️ [{eid}] WS不可用，降级为REST")
                             use_rest_mode = True
                             continue
                         else:
-                            raise e
+                            raise
 
-                # --- 数据处理 ---
                 self.process_data(eid, tickers, relevant_symbols)
 
             except Exception as e:
                 err_msg = str(e)
                 if "support" in err_msg.lower() and not use_rest_mode:
-                     use_rest_mode = True
+                    use_rest_mode = True
                 else:
-                    # 避免日志刷屏，只记录简短错误
-                    logger.warning(f"⚠️ [{eid}] 连接抖动: {err_msg[:50]}... 5秒后重连")
+                    logger.warning(f"⚠️ [{eid}] 连接抖动: {err_msg[:80]}... 5秒后重试")
                     await asyncio.sleep(5)
 
     def process_data(self, eid, tickers, relevant_symbols):
-        """处理并过滤行情数据"""
         current_ts = time.time() * 1000
-        
         for symbol, ticker in tickers.items():
-            # ⚡ 极速过滤：只处理我们在乎的币种
-            if symbol not in relevant_symbols: 
-                continue 
-            
+            if symbol not in relevant_symbols: continue
+
             bid = ticker.get('bid')
             ask = ticker.get('ask')
-            
+            bid_vol = ticker.get('bidVolume')
+            ask_vol = ticker.get('askVolume')
+
             if not bid or not ask: continue
 
-            # 时间戳处理：如果滞后严重，用当前时间覆盖
-            ts = ticker.get('timestamp')
-            if ts is None or ts < current_ts - 30000:
-                ts = current_ts
-
-            # 更新内存数据
             self.price_data[symbol][eid] = {
                 'bid': float(bid),
                 'ask': float(ask),
-                'ts': ts
+                'bidVol': float(bid_vol) if bid_vol is not None else None,
+                'askVol': float(ask_vol) if ask_vol is not None else None,
+                'ts': ticker.get('timestamp') or current_ts,
+                'quoteVolume': ticker.get('quoteVolume', 0)
             }
-            
-            # 触发比价逻辑
+
             self.calculate_arbitrage(symbol, trigger_ex=eid)
 
     def calculate_arbitrage(self, symbol, trigger_ex):
-        """O(N) 复杂度的比价逻辑"""
         platforms = self.price_data.get(symbol)
         if not platforms or len(platforms) < 2: return
 
         trigger_data = platforms[trigger_ex]
-        
-        # 只对比 trigger_ex 和其他交易所
         for other_ex, other_data in platforms.items():
             if other_ex == trigger_ex: continue
 
-            # 1. 时间窗口检查 (剔除陈旧数据)
             time_diff = abs(trigger_data['ts'] - other_data['ts'])
-            if time_diff > MAX_TIME_DIFF_MS:
-                continue
+            if time_diff > MAX_TIME_DIFF_MS: continue
 
-            # 2. 路径 A: Trigger 买 -> Other 卖
             self.check_profit(trigger_ex, other_ex, symbol, trigger_data['ask'], other_data['bid'])
-            
-            # 3. 路径 B: Other 买 -> Trigger 卖
             self.check_profit(other_ex, trigger_ex, symbol, other_data['ask'], trigger_data['bid'])
 
     def check_profit(self, buy_ex, sell_ex, symbol, buy_price, sell_price):
-        if buy_price <= 0: return
-
-        # 异常价格过滤（避免假阳性巨额套利）
-        if buy_price < 1e-8 or sell_price < 1e-8 or buy_price > 1e8 or sell_price > 1e8:
+        if buy_price <= 0 or sell_price <= buy_price:
             return
 
-        # 净利计算: (卖出所得 - 买入成本) / 买入成本
-        # 卖出所得 = sell_price * (1 - fee)
-        # 买入成本 = buy_price * (1 + fee)
-        
-        net_profit = (sell_price * (1 - TAKER_FEE_RATE) / (buy_price * (1 + TAKER_FEE_RATE)) - 1) * 100
+        # 防ticker冲突假机会
+        price_ratio = max(sell_price / buy_price, buy_price / sell_price)
+        if price_ratio > MAX_PRICE_RATIO:
+            return
+
+        platforms = self.price_data.get(symbol, {})
+        buy_data = platforms.get(buy_ex, {})
+        sell_data = platforms.get(sell_ex, {})
+
+        buy_vol = buy_data.get('askVol')
+        sell_vol = sell_data.get('bidVol')
+        buy_depth_usdt = buy_vol * buy_price if buy_vol is not None else 0
+        sell_depth_usdt = sell_vol * sell_price if sell_vol is not None else 0
+
+        if MIN_DEPTH_USDT > 0 and (buy_depth_usdt < MIN_DEPTH_USDT or sell_depth_usdt < MIN_DEPTH_USDT):
+            return
+
+        buy_fee = FEE_RATES.get(buy_ex, FEE_RATES['default'])
+        sell_fee = FEE_RATES.get(sell_ex, FEE_RATES['default'])
+        net_profit = (sell_price * (1 - sell_fee) / (buy_price * (1 + buy_fee)) - 1) * 100
 
         if net_profit > PROFIT_THRESHOLD:
-            # 日志冷却检查
-            key = (symbol, buy_ex, sell_ex)
+            alert_key = (buy_ex, sell_ex)
             now = time.time()
-            if key in self.last_alert and now - self.last_alert[key] < 30:
+            if now - self.last_alert_time[symbol][alert_key] < ALERT_COOLDOWN:
                 return
-            self.last_alert[key] = now
+            self.last_alert_time[symbol][alert_key] = now
 
             self.opp_count += 1
-            # 简单计算一个毛利给日志看
             gross = (sell_price - buy_price) / buy_price * 100
-            
+
+            # 只显示USDT深度
+            buy_depth_str = f"{buy_depth_usdt:.1f} " if buy_vol is not None else "N/A"
+            sell_depth_str = f"{sell_depth_usdt:.1f} " if sell_vol is not None else "N/A"
+
             logger.info(
                 f"🔥 [机会 #{self.opp_count}] {symbol} | "
-                f"{buy_ex} -> {sell_ex}\n"
-                f"   💰 净利: {net_profit:.2f}% (毛利 {gross:.2f}%)\n"
-                f"   🟢 买: {buy_price:<10} 🔴 卖: {sell_price:<10} (差价: {(sell_price-buy_price):.4f})"
+                f"{buy_ex} → {sell_ex} | 净利: {net_profit:.2f}% (毛利 {gross:.2f}%)\n"
+                f"   🟢 买价: {buy_price:<12} | 可买入: {buy_depth_str}\n"
+                f"   🔴 卖价: {sell_price:<12} | 可卖出: {sell_depth_str}\n"
+                f"   📊 24h量: {buy_data.get('quoteVolume',0):.0f} / {sell_data.get('quoteVolume',0):.0f} USDT"
             )
 
-            # 广播给WebSocket客户端
-            asyncio.create_task(self.broadcast({
-                "type": "arbitrage",
-                "data": {
-                    "symbol": symbol,
-                    "buy_ex": buy_ex,
-                    "sell_ex": sell_ex,
-                    "net_profit": net_profit,
-                    "buy_price": buy_price,
-                    "sell_price": sell_price
-                }
-            }))
+            # 添加到Web面板
+            self.recent_opportunities.append({
+                'time': time.strftime('%H:%M:%S'),
+                'symbol': symbol,
+                'buy_ex': buy_ex,
+                'sell_ex': sell_ex,
+                'net_profit': round(net_profit, 2),
+                'gross': round(gross, 2),
+                'buy_price': buy_price,
+                'sell_price': sell_price,
+                'buy_vol': buy_depth_str,
+                'sell_vol': sell_depth_str
+            })
+            if len(self.recent_opportunities) > 50:
+                self.recent_opportunities.pop(0)
 
-    async def broadcast(self, message):
-        if not self.clients:
-            return
+    def start_web_panel(self):
+        app = FastAPI(title="套利机器人 - Web面板")
 
-        data = json.dumps(message)
-        dead = set()
+        @app.get("/", response_class=HTMLResponse)
+        async def dashboard():
+            rows = ""
+            for opp in reversed(self.recent_opportunities[-30:]):
+                profit_color = "text-green-400" if opp['net_profit'] >= 2 else "text-yellow-400"
+                rows += f"""
+                <tr class="border-b border-gray-700 hover:bg-gray-750">
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-400">{opp['time']}</td>
+                    <td class="px-6 py-4 font-medium text-white">{opp['symbol']}</td>
+                    <td class="px-6 py-4">
+                        <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-900 text-green-300">
+                            {opp['buy_ex']}
+                        </span>
+                        <span class="mx-2 text-gray-500">→</span>
+                        <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-red-900 text-red-300">
+                            {opp['sell_ex']}
+                        </span>
+                    </td>
+                    <td class="px-6 py-4 text-right font-mono {profit_color} font-bold">{opp['net_profit']}%</td>
+                    <td class="px-6 py-4 text-right text-white">{opp['buy_price']}</td>
+                    <td class="px-6 py-4 text-sm text-gray-300">{opp['buy_vol']}</td>
+                    <td class="px-6 py-4 text-right text-white">{opp['sell_price']}</td>
+                    <td class="px-6 py-4 text-sm text-gray-300">{opp['sell_vol']}</td>
+                </tr>
+                """
 
-        for client in list(self.clients):  # 用 list 避免运行时修改集合
-            if client.state is not State.OPEN:
-                dead.add(client)
-                continue
-            try:
-                await client.send(data)
-            except Exception:
-                dead.add(client)
+            html = f"""
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>套利机器人 - 实时监控面板</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>function refresh() {{ location.reload(); }} setInterval(refresh, 5000);</script>
+</head>
+<body class="bg-zinc-950 text-zinc-200">
+    <div class="max-w-7xl mx-auto p-8">
+        <div class="flex justify-between items-center mb-8">
+            <h1 class="text-4xl font-bold text-emerald-400">🔥 跨所现货套利实时监控</h1>
+            <div class="text-sm text-zinc-500">每5秒刷新 • {time.strftime('%Y-%m-%d %H:%M:%S')}</div>
+        </div>
 
-        # 清理已关闭的连接
-        self.clients.difference_update(dead)
+        <div class="grid grid-cols-4 gap-6 mb-10">
+            <div class="bg-zinc-900 p-6 rounded-2xl border border-zinc-800">
+                <div class="text-xs text-zinc-500">已连接交易所</div>
+                <div class="text-5xl font-bold text-white mt-2">{len(self.exchanges)}</div>
+            </div>
+            <div class="bg-zinc-900 p-6 rounded-2xl border border-zinc-800">
+                <div class="text-xs text-zinc-500">监控交易对</div>
+                <div class="text-5xl font-bold text-white mt-2">{len(self.target_symbols)}</div>
+            </div>
+            <div class="bg-zinc-900 p-6 rounded-2xl border border-zinc-800">
+                <div class="text-xs text-zinc-500">累计发现机会</div>
+                <div class="text-5xl font-bold text-emerald-400 mt-2">{self.opp_count}</div>
+            </div>
+            <div class="bg-zinc-900 p-6 rounded-2xl border border-zinc-800">
+                <div class="text-xs text-zinc-500">面板端口</div>
+                <div class="text-5xl font-bold text-amber-400 mt-2">8000</div>
+            </div>
+        </div>
 
-    async def websocket_handler(self, websocket):
-        self.clients.add(websocket)
-        try:
-            # 发送初始化信息
-            await websocket.send(json.dumps({
-                "type": "init",
-                "exchanges": list(self.exchanges.keys()),
-                "symbol_count": len(self.target_symbols)
-            }))
-            await websocket.wait_closed()
-        finally:
-            self.clients.remove(websocket)
+        <div class="bg-zinc-900 rounded-3xl overflow-hidden border border-zinc-800">
+            <div class="bg-zinc-800 px-8 py-5 flex justify-between items-center">
+                <h2 class="text-2xl font-semibold">💰 最新套利机会</h2>
+                <div class="text-xs bg-zinc-700 px-4 py-1.5 rounded-full">最新30条</div>
+            </div>
+            <table class="w-full text-sm">
+                <thead>
+                    <tr class="bg-zinc-950 border-b border-zinc-800 text-zinc-400 text-xs">
+                        <th class="px-6 py-5 text-left font-normal">时间</th>
+                        <th class="px-6 py-5 text-left font-normal">交易对</th>
+                        <th class="px-6 py-5 text-left font-normal">买卖方向</th>
+                        <th class="px-6 py-5 text-right font-normal">净利</th>
+                        <th class="px-6 py-5 text-right font-normal">买价</th>
+                        <th class="px-6 py-5 text-left font-normal">可买入 (USDT)</th>
+                        <th class="px-6 py-5 text-right font-normal">卖价</th>
+                        <th class="px-6 py-5 text-left font-normal">可卖出 (USDT)</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-zinc-800">
+                    {rows}
+                </tbody>
+            </table>
+            {'' if self.recent_opportunities else '<div class="text-center py-20 text-zinc-500">暂无机会，耐心等待...</div>'}
+        </div>
+
+        <div class="text-center text-xs text-zinc-600 mt-8">
+            跨所套利机器人 • 高雄本地运行 • 按 Ctrl+C 停止
+        </div>
+    </div>
+</body>
+</html>
+            """
+            return html
+
+        def run_server():
+            uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+
+        self.server_thread = threading.Thread(target=run_server, daemon=True)
+        self.server_thread.start()
+        logger.info("🌐 Web面板已启动 → http://127.0.0.1:8000")
 
     async def run(self):
-        if not await self.init_exchanges(): return
-
-        # 启动 WebSocket 服务器
-        ws_server = await websockets.serve(
-            self.websocket_handler,
-            "127.0.0.1", 8765
-        )
-        logger.info("WebSocket 服务器启动 ws://127.0.0.1:8765")
-
+        if not await self.init_exchanges():
+            return
+        self.start_web_panel()
         tasks = [self.watch_tickers_loop(eid) for eid in self.exchanges.keys()]
-        
-        logger.info("🚀 监控引擎启动... (按 Ctrl+C 停止)")
+        logger.info("🚀 监控引擎启动... (Ctrl+C 停止)")
         try:
-            await asyncio.gather(*tasks, ws_server.wait_closed())
+            await asyncio.gather(*tasks)
         except Exception as e:
             logger.error(f"主程序错误: {e}")
         finally:
@@ -315,14 +366,13 @@ class GlobalArbitrageMonitor:
 
     async def shutdown(self):
         logger.info("正在关闭连接...")
-        for name, ex in self.exchanges.items():
+        for ex in self.exchanges.values():
             await ex.close()
         logger.info("👋 再见")
 
 if __name__ == "__main__":
     bot = GlobalArbitrageMonitor()
     try:
-        # Windows Python 3.8+ 兼容性设置
         if hasattr(asyncio, 'WindowsSelectorEventLoopPolicy'):
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         asyncio.run(bot.run())
