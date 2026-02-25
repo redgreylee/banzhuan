@@ -101,8 +101,13 @@ class GlobalArbitrageMonitor:
         now_ts = time.time() * 1000
         for symbol, t in tickers.items():
             if symbol not in relevant_symbols or not t.get('bid') or not t.get('ask'): continue
+            bid = float(t['bid'])
+            ask = float(t['ask'])
+            if bid <= 0 or ask <= 0 or bid > ask:  # 新增：bid/ask异常检查
+                logger.warning(f"⚠️ 异常价格: {symbol}@{eid} | bid {bid}, ask {ask}")
+                continue
             self.price_data[symbol][eid] = {
-                'bid': float(t['bid']), 'ask': float(t['ask']),
+                'bid': bid, 'ask': ask,
                 'bidVol': float(t.get('bidVolume', 0) or 0),
                 'askVol': float(t.get('askVolume', 0) or 0),
                 'ts': t.get('timestamp') or now_ts,
@@ -120,6 +125,12 @@ class GlobalArbitrageMonitor:
     def check_profit(self, buy_ex, sell_ex, symbol, b_price, s_price):
         if b_price <= 0 or s_price <= b_price: return
         
+        # 新增：过滤异常价格比率
+        price_ratio = s_price / b_price
+        if price_ratio > MAX_PRICE_RATIO or price_ratio < 1 / MAX_PRICE_RATIO:
+            ##logger.warning(f"⚠️ 异常价格比率: {symbol} | {buy_ex}买价 {b_price}, {sell_ex}卖价 {s_price} | 比率 {price_ratio:.2f}")
+            return
+
         # 计算深度
         b_depth = self.price_data[symbol][buy_ex].get('askVol', 0) * b_price
         s_depth = self.price_data[symbol][sell_ex].get('bidVol', 0) * s_price
@@ -128,6 +139,11 @@ class GlobalArbitrageMonitor:
         # 净利计算
         b_fee, s_fee = FEE_RATES.get(buy_ex, 0.002), FEE_RATES.get(sell_ex, 0.002)
         net_profit = (s_price * (1 - s_fee) / (b_price * (1 + b_fee)) - 1) * 100
+
+        # 新增：过滤异常高利润（上限50%）
+        if net_profit > 50.0:
+            ##logger.warning(f"⚠️ 异常高利润: {symbol} | 利润 {net_profit:.2f}% | 可能数据错误")
+            return
 
         if net_profit > PROFIT_THRESHOLD:
             key = (buy_ex, sell_ex)
