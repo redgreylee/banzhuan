@@ -3,10 +3,10 @@ import ccxt.pro as ccxtpro
 import ccxt
 import time
 import logging
-from collections import defaultdict
+from collections import defaultdict, deque  # 引入 deque
 from logging.handlers import TimedRotatingFileHandler
 
-# 新增：Web面板依赖
+# Web面板依赖
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 import uvicorn
@@ -33,7 +33,7 @@ console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
 # --- 2. 核心配置区 ---
-EXCHANGE_IDS = ['binance', 'okx', 'bybit', 'gate', 'kucoin', 'mexc', 'bitget']
+EXCHANGE_IDS = ['binance', 'okx', 'bybit', 'gate', 'kucoin', 'mexc', 'bitget', 'bitmart', 'htx']
 
 PROXY_URL = 'http://127.0.0.1:7890'   # 台湾环境若无需代理请改成 ''
 
@@ -44,7 +44,10 @@ REST_POLL_INTERVAL = 2.0
 FEE_RATES = {
     'binance': 0.0010, 'okx': 0.0010, 'bybit': 0.0010,
     'gate': 0.0020, 'kucoin': 0.0020, 'mexc': 0.0020,
-    'bitget': 0.0020, 'default': 0.0020
+    'bitget': 0.0020, 
+    'htx': 0.0020,      # 新增：火币手续费 0.2%
+    'bitmart': 0.0025,  # 新增：Bitmart手续费 0.25%
+    'default': 0.0020
 }
 
 MIN_QUOTE_VOLUME = 50000
@@ -61,7 +64,9 @@ class GlobalArbitrageMonitor:
         self.target_symbols = set()
         self.opp_count = 0
         self.last_alert_time = defaultdict(lambda: defaultdict(int))
-        self.recent_opportunities = []   # Web面板用
+        
+        # 【优化】使用双端队列管理机会列表，设定最大长度 50，具备优秀的线程安全性及 O(1) 性能
+        self.recent_opportunities = deque(maxlen=50)
 
     async def init_exchanges(self):
         base_config = {
@@ -126,6 +131,7 @@ class GlobalArbitrageMonitor:
                     await asyncio.sleep(REST_POLL_INTERVAL)
                 else:
                     try:
+                        # 对于支持全量WS的交易所，无参调用即可；若遇到订阅失败，也可尝试改为 ex.watch_tickers(list(relevant_symbols))
                         tickers = await ex.watch_tickers()
                     except (ccxt.NotSupported, ccxt.ExchangeError, ccxt.BadRequest) as e:
                         if "support" in str(e).lower() or "method" in str(e).lower():
@@ -186,7 +192,6 @@ class GlobalArbitrageMonitor:
         if buy_price <= 0 or sell_price <= buy_price:
             return
 
-        # 防ticker冲突假机会
         price_ratio = max(sell_price / buy_price, buy_price / sell_price)
         if price_ratio > MAX_PRICE_RATIO:
             return
@@ -217,7 +222,6 @@ class GlobalArbitrageMonitor:
             self.opp_count += 1
             gross = (sell_price - buy_price) / buy_price * 100
 
-            # 只显示USDT深度
             buy_depth_str = f"{buy_depth_usdt:.1f} " if buy_vol is not None else "N/A"
             sell_depth_str = f"{sell_depth_usdt:.1f} " if sell_vol is not None else "N/A"
 
@@ -229,7 +233,6 @@ class GlobalArbitrageMonitor:
                 f"   📊 24h量: {buy_data.get('quoteVolume',0):.0f} / {sell_data.get('quoteVolume',0):.0f} USDT"
             )
 
-            # 添加到Web面板
             self.recent_opportunities.append({
                 'time': time.strftime('%H:%M:%S'),
                 'symbol': symbol,
@@ -242,8 +245,6 @@ class GlobalArbitrageMonitor:
                 'buy_vol': buy_depth_str,
                 'sell_vol': sell_depth_str
             })
-            if len(self.recent_opportunities) > 50:
-                self.recent_opportunities.pop(0)
 
     def start_web_panel(self):
         app = FastAPI(title="套利机器人 - Web面板")
@@ -251,7 +252,9 @@ class GlobalArbitrageMonitor:
         @app.get("/", response_class=HTMLResponse)
         async def dashboard():
             rows = ""
-            for opp in reversed(self.recent_opportunities[-30:]):
+            # 【优化】将 deque 转换为 list 后进行切片，避免 TypeError
+            recent_list = list(self.recent_opportunities)[-30:]
+            for opp in reversed(recent_list):
                 profit_color = "text-green-400" if opp['net_profit'] >= 2 else "text-yellow-400"
                 rows += f"""
                 <tr class="border-b border-gray-700 hover:bg-gray-750">
@@ -345,7 +348,8 @@ class GlobalArbitrageMonitor:
             return html
 
         def run_server():
-            uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+            # 【优化】将 log_level 调整为 warning，防止页面定时刷新的 200 OK 刷屏
+            uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
 
         self.server_thread = threading.Thread(target=run_server, daemon=True)
         self.server_thread.start()
@@ -373,6 +377,7 @@ class GlobalArbitrageMonitor:
 if __name__ == "__main__":
     bot = GlobalArbitrageMonitor()
     try:
+        # 兼容 Windows ProactorEventLoop 在 CCXT Pro 下的报错问题
         if hasattr(asyncio, 'WindowsSelectorEventLoopPolicy'):
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         asyncio.run(bot.run())
