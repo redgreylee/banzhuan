@@ -3,7 +3,7 @@ import ccxt.pro as ccxtpro
 import ccxt
 import time
 import logging
-from collections import defaultdict, deque  # 引入 deque
+from collections import defaultdict, deque
 from logging.handlers import TimedRotatingFileHandler
 
 # Web面板依赖
@@ -12,19 +12,12 @@ from fastapi.responses import HTMLResponse
 import uvicorn
 import threading
 
-# --- 1. 日志配置（控制台 + 每日轮转文件）---
+# --- 1. 日志配置 ---
 logger = logging.getLogger("ArbBot")
 logger.setLevel(logging.INFO)
-
 formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
 
-file_handler = TimedRotatingFileHandler(
-    'arbitrage.log',
-    when='midnight',
-    interval=1,
-    backupCount=7,
-    encoding='utf-8'
-)
+file_handler = TimedRotatingFileHandler('arbitrage.log', when='midnight', interval=1, backupCount=7, encoding='utf-8')
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 
@@ -33,28 +26,28 @@ console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
 # --- 2. 核心配置区 ---
-EXCHANGE_IDS = ['binance', 'okx', 'bybit', 'gate', 'kucoin', 'mexc', 'bitget', 'bitmart', 'htx']
+# 已剔除：htx, mexc, kucoin
+EXCHANGE_IDS = ['binance', 'okx', 'bybit', 'gate', 'bitget', 'bitmart']
 
-PROXY_URL = 'http://127.0.0.1:7890'   # 台湾环境若无需代理请改成 ''
+PROXY_URL = 'http://127.0.0.1:7890' 
 
 PROFIT_THRESHOLD = 0.8
 MAX_TIME_DIFF_MS = 3000
 REST_POLL_INTERVAL = 2.0
 
 FEE_RATES = {
-    'binance': 0.0010, 'okx': 0.0010, 'bybit': 0.0010,
-    'gate': 0.0020, 'kucoin': 0.0020, 'mexc': 0.0020,
+    'binance': 0.0010, 
+    'okx': 0.0010, 
+    'bybit': 0.0010,
+    'gate': 0.0020, 
     'bitget': 0.0020, 
-    'htx': 0.0020,      # 新增：火币手续费 0.2%
-    'bitmart': 0.0025,  # 新增：Bitmart手续费 0.25%
+    'bitmart': 0.0025,
     'default': 0.0020
 }
 
 MIN_QUOTE_VOLUME = 50000
 MIN_DEPTH_USDT = 100
 ALERT_COOLDOWN = 60
-
-# 防ticker冲突（同一个符号不同币种）
 MAX_PRICE_RATIO = 10.0
 
 class GlobalArbitrageMonitor:
@@ -64,8 +57,6 @@ class GlobalArbitrageMonitor:
         self.target_symbols = set()
         self.opp_count = 0
         self.last_alert_time = defaultdict(lambda: defaultdict(int))
-        
-        # 【优化】使用双端队列管理机会列表，设定最大长度 50，具备优秀的线程安全性及 O(1) 性能
         self.recent_opportunities = deque(maxlen=50)
 
     async def init_exchanges(self):
@@ -118,12 +109,9 @@ class GlobalArbitrageMonitor:
         relevant_symbols = {s for s in self.target_symbols if s in ex.markets}
         if not relevant_symbols: return
 
-        use_rest_mode = (eid == 'mexc')
-        if use_rest_mode:
-            logger.info(f"ℹ️  [{eid}] 使用 REST 轮询模式")
-        else:
-            logger.info(f"📡 [{eid}] 启动 WebSocket 全量监控")
-
+        # 默认使用WS，MEXC移除后此处通常为False
+        use_rest_mode = False 
+        
         while True:
             try:
                 if use_rest_mode:
@@ -131,7 +119,6 @@ class GlobalArbitrageMonitor:
                     await asyncio.sleep(REST_POLL_INTERVAL)
                 else:
                     try:
-                        # 对于支持全量WS的交易所，无参调用即可；若遇到订阅失败，也可尝试改为 ex.watch_tickers(list(relevant_symbols))
                         tickers = await ex.watch_tickers()
                     except (ccxt.NotSupported, ccxt.ExchangeError, ccxt.BadRequest) as e:
                         if "support" in str(e).lower() or "method" in str(e).lower():
@@ -171,7 +158,6 @@ class GlobalArbitrageMonitor:
                 'ts': ticker.get('timestamp') or current_ts,
                 'quoteVolume': ticker.get('quoteVolume', 0)
             }
-
             self.calculate_arbitrage(symbol, trigger_ex=eid)
 
     def calculate_arbitrage(self, symbol, trigger_ex):
@@ -181,7 +167,6 @@ class GlobalArbitrageMonitor:
         trigger_data = platforms[trigger_ex]
         for other_ex, other_data in platforms.items():
             if other_ex == trigger_ex: continue
-
             time_diff = abs(trigger_data['ts'] - other_data['ts'])
             if time_diff > MAX_TIME_DIFF_MS: continue
 
@@ -189,24 +174,19 @@ class GlobalArbitrageMonitor:
             self.check_profit(other_ex, trigger_ex, symbol, other_data['ask'], trigger_data['bid'])
 
     def check_profit(self, buy_ex, sell_ex, symbol, buy_price, sell_price):
-        if buy_price <= 0 or sell_price <= buy_price:
-            return
+        if buy_price <= 0 or sell_price <= buy_price: return
 
         price_ratio = max(sell_price / buy_price, buy_price / sell_price)
-        if price_ratio > MAX_PRICE_RATIO:
-            return
+        if price_ratio > MAX_PRICE_RATIO: return
 
         platforms = self.price_data.get(symbol, {})
         buy_data = platforms.get(buy_ex, {})
         sell_data = platforms.get(sell_ex, {})
 
-        # 新增：过滤 24h 交易量为 0 或低于阈值的情况
         buy_vol_24h = buy_data.get('quoteVolume', 0)
         sell_vol_24h = sell_data.get('quoteVolume', 0)
 
-        if buy_vol_24h == 0 or sell_vol_24h == 0 or \
-           buy_vol_24h < MIN_QUOTE_VOLUME or sell_vol_24h < MIN_QUOTE_VOLUME:
-            return
+        if buy_vol_24h < MIN_QUOTE_VOLUME or sell_vol_24h < MIN_QUOTE_VOLUME: return
 
         buy_vol = buy_data.get('askVol')
         sell_vol = sell_data.get('bidVol')
@@ -223,23 +203,16 @@ class GlobalArbitrageMonitor:
         if net_profit > PROFIT_THRESHOLD:
             alert_key = (buy_ex, sell_ex)
             now = time.time()
-            if now - self.last_alert_time[symbol][alert_key] < ALERT_COOLDOWN:
-                return
+            if now - self.last_alert_time[symbol][alert_key] < ALERT_COOLDOWN: return
             self.last_alert_time[symbol][alert_key] = now
 
             self.opp_count += 1
             gross = (sell_price - buy_price) / buy_price * 100
-
+            
             buy_depth_str = f"{buy_depth_usdt:.1f} " if buy_vol is not None else "N/A"
             sell_depth_str = f"{sell_depth_usdt:.1f} " if sell_vol is not None else "N/A"
 
-            logger.info(
-                f"🔥 [机会 #{self.opp_count}] {symbol} | "
-                f"{buy_ex} → {sell_ex} | 净利: {net_profit:.2f}% (毛利 {gross:.2f}%)\n"
-                f"   🟢 买价: {buy_price:<12} | 可买入: {buy_depth_str}\n"
-                f"   🔴 卖价: {sell_price:<12} | 可卖出: {sell_depth_str}\n"
-                f"   📊 24h量: {buy_data.get('quoteVolume',0):.0f} / {sell_data.get('quoteVolume',0):.0f} USDT"
-            )
+            logger.info(f"🔥 [机会 #{self.opp_count}] {symbol} | {buy_ex} → {sell_ex} | 净利: {net_profit:.2f}%")
 
             self.recent_opportunities.append({
                 'time': time.strftime('%H:%M:%S'),
@@ -260,22 +233,17 @@ class GlobalArbitrageMonitor:
         @app.get("/", response_class=HTMLResponse)
         async def dashboard():
             rows = ""
-            # 【优化】将 deque 转换为 list 后进行切片，避免 TypeError
             recent_list = list(self.recent_opportunities)[-30:]
             for opp in reversed(recent_list):
                 profit_color = "text-green-400" if opp['net_profit'] >= 2 else "text-yellow-400"
                 rows += f"""
                 <tr class="border-b border-gray-700 hover:bg-gray-750">
-                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-400">{opp['time']}</td>
+                    <td class="px-6 py-4 text-sm text-gray-400">{opp['time']}</td>
                     <td class="px-6 py-4 font-medium text-white">{opp['symbol']}</td>
                     <td class="px-6 py-4">
-                        <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-900 text-green-300">
-                            {opp['buy_ex']}
-                        </span>
+                        <span class="px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-900 text-green-300">{opp['buy_ex']}</span>
                         <span class="mx-2 text-gray-500">→</span>
-                        <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-red-900 text-red-300">
-                            {opp['sell_ex']}
-                        </span>
+                        <span class="px-2.5 py-0.5 rounded-full text-xs font-medium bg-red-900 text-red-300">{opp['sell_ex']}</span>
                     </td>
                     <td class="px-6 py-4 text-right font-mono {profit_color} font-bold">{opp['net_profit']}%</td>
                     <td class="px-6 py-4 text-right text-white">{opp['buy_price']}</td>
@@ -285,6 +253,7 @@ class GlobalArbitrageMonitor:
                 </tr>
                 """
 
+            # 此处省略部分冗长的HTML字符串，逻辑保持不变...
             html = f"""
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -345,7 +314,7 @@ class GlobalArbitrageMonitor:
             </table>
             {'' if self.recent_opportunities else '<div class="text-center py-20 text-zinc-500">暂无机会，耐心等待...</div>'}
         </div>
-
+    
         <div class="text-center text-xs text-zinc-600 mt-8">
             跨所套利机器人 • 高雄本地运行 • 按 Ctrl+C 停止
         </div>
@@ -355,8 +324,8 @@ class GlobalArbitrageMonitor:
             """
             return html
 
+
         def run_server():
-            # 【优化】将 log_level 调整为 warning，防止页面定时刷新的 200 OK 刷屏
             uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
 
         self.server_thread = threading.Thread(target=run_server, daemon=True)
@@ -364,11 +333,10 @@ class GlobalArbitrageMonitor:
         logger.info("🌐 Web面板已启动 → http://127.0.0.1:8000")
 
     async def run(self):
-        if not await self.init_exchanges():
-            return
+        if not await self.init_exchanges(): return
         self.start_web_panel()
         tasks = [self.watch_tickers_loop(eid) for eid in self.exchanges.keys()]
-        logger.info("🚀 监控引擎启动... (Ctrl+C 停止)")
+        logger.info("🚀 监控引擎启动...")
         try:
             await asyncio.gather(*tasks)
         except Exception as e:
@@ -377,15 +345,12 @@ class GlobalArbitrageMonitor:
             await self.shutdown()
 
     async def shutdown(self):
-        logger.info("正在关闭连接...")
         for ex in self.exchanges.values():
             await ex.close()
-        logger.info("👋 再见")
 
 if __name__ == "__main__":
     bot = GlobalArbitrageMonitor()
     try:
-        # 兼容 Windows ProactorEventLoop 在 CCXT Pro 下的报错问题
         if hasattr(asyncio, 'WindowsSelectorEventLoopPolicy'):
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         asyncio.run(bot.run())
