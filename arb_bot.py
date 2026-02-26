@@ -9,8 +9,11 @@ from logging.handlers import TimedRotatingFileHandler
 # Web面板依赖
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
+from fastapi import WebSocket, WebSocketDisconnect
 import uvicorn
 import threading
+import json
+from typing import List
 
 # --- 1. 日志配置 ---
 logger = logging.getLogger("ArbBot")
@@ -26,6 +29,30 @@ console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
 # --- 2. 核心配置区 ---
+# WebSocket 连接管理器
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: dict):
+        """广播消息到所有客户端"""
+        for connection in self.active_connections[:]:  # 复制列表避免迭代时修改
+            try:
+                await connection.send_json(message)
+            except Exception:
+                # 移除无效连接
+                self.active_connections.remove(connection)
+
+# 全局 WebSocket 管理器
+ws_manager = ConnectionManager()
+
 # 已剔除：htx, mexc, kucoin
 EXCHANGE_IDS = ['binance', 'okx', 'bybit', 'gate', 'bitget', 'bitmart']
 
@@ -214,7 +241,7 @@ class GlobalArbitrageMonitor:
 
             logger.info(f"🔥 [机会 #{self.opp_count}] {symbol} | {buy_ex} → {sell_ex} | 净利: {net_profit:.2f}%")
 
-            self.recent_opportunities.append({
+            opportunity = {
                 'time': time.strftime('%H:%M:%S'),
                 'symbol': symbol,
                 'buy_ex': buy_ex,
@@ -225,64 +252,98 @@ class GlobalArbitrageMonitor:
                 'sell_price': sell_price,
                 'buy_vol': buy_depth_str,
                 'sell_vol': sell_depth_str
-            })
+            }
+            self.recent_opportunities.append(opportunity)
+            
+            # 通过 WebSocket 广播新机会
+            asyncio.create_task(ws_manager.broadcast({
+                'type': 'new_opportunity',
+                'data': opportunity
+            }))
 
     def start_web_panel(self):
         app = FastAPI(title="套利机器人 - Web面板")
+        monitor = self  # 引用到闭包中
+
+        # WebSocket 端点
+        @app.websocket("/ws")
+        async def websocket_endpoint(websocket: WebSocket):
+            await ws_manager.connect(websocket)
+            try:
+                # 发送当前状态
+                await websocket.send_json({
+                    'type': 'init',
+                    'exchanges': len(monitor.exchanges),
+                    'symbols': len(monitor.target_symbols),
+                    'opp_count': monitor.opp_count
+                })
+                while True:
+                    # 保持连接，等待心跳或断开
+                    try:
+                        await asyncio.wait_for(websocket.receive_text(), timeout=30)
+                    except asyncio.TimeoutError:
+                        # 发送心跳
+                        await websocket.send_json({'type': 'ping'})
+            except WebSocketDisconnect:
+                ws_manager.disconnect(websocket)
+
+        # 获取最新机会的 REST API
+        @app.get("/api/opportunities")
+        async def get_opportunities():
+            return list(monitor.recent_opportunities)[-30:]
+
+        # 获取统计信息
+        @app.get("/api/stats")
+        async def get_stats():
+            return {
+                'exchanges': len(monitor.exchanges),
+                'symbols': len(monitor.target_symbols),
+                'opp_count': monitor.opp_count
+            }
 
         @app.get("/", response_class=HTMLResponse)
         async def dashboard():
-            rows = ""
-            recent_list = list(self.recent_opportunities)[-30:]
-            for opp in reversed(recent_list):
-                profit_color = "text-green-400" if opp['net_profit'] >= 2 else "text-yellow-400"
-                rows += f"""
-                <tr class="border-b border-gray-700 hover:bg-gray-750">
-                    <td class="px-6 py-4 text-sm text-gray-400">{opp['time']}</td>
-                    <td class="px-6 py-4 font-medium text-white">{opp['symbol']}</td>
-                    <td class="px-6 py-4">
-                        <span class="px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-900 text-green-300">{opp['buy_ex']}</span>
-                        <span class="mx-2 text-gray-500">→</span>
-                        <span class="px-2.5 py-0.5 rounded-full text-xs font-medium bg-red-900 text-red-300">{opp['sell_ex']}</span>
-                    </td>
-                    <td class="px-6 py-4 text-right font-mono {profit_color} font-bold">{opp['net_profit']}%</td>
-                    <td class="px-6 py-4 text-right text-white">{opp['buy_price']}</td>
-                    <td class="px-6 py-4 text-sm text-gray-300">{opp['buy_vol']}</td>
-                    <td class="px-6 py-4 text-right text-white">{opp['sell_price']}</td>
-                    <td class="px-6 py-4 text-sm text-gray-300">{opp['sell_vol']}</td>
-                </tr>
-                """
-
-            # 此处省略部分冗长的HTML字符串，逻辑保持不变...
-            html = f"""
-<!DOCTYPE html>
+            # WebSocket 实时推送版本
+            html = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>套利机器人 - 实时监控面板</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <script>function refresh() {{ location.reload(); }} setInterval(refresh, 5000);</script>
+    <style>
+        .highlight { animation: flash 1s ease-out; }
+        @keyframes flash {
+            0% { background-color: rgba(52, 211, 153, 0.3); }
+            100% { background-color: transparent; }
+        }
+    </style>
 </head>
 <body class="bg-zinc-950 text-zinc-200">
     <div class="max-w-7xl mx-auto p-8">
         <div class="flex justify-between items-center mb-8">
             <h1 class="text-4xl font-bold text-emerald-400">🔥 跨所现货套利实时监控</h1>
-            <div class="text-sm text-zinc-500">每5秒刷新 • {time.strftime('%Y-%m-%d %H:%M:%S')}</div>
+            <div class="flex items-center gap-4">
+                <div class="flex items-center gap-2">
+                    <div id="ws-status" class="w-2 h-2 rounded-full bg-yellow-400"></div>
+                    <span id="ws-text" class="text-sm text-zinc-500">连接中...</span>
+                </div>
+                <div class="text-sm text-zinc-500" id="update-time"></div>
+            </div>
         </div>
 
         <div class="grid grid-cols-4 gap-6 mb-10">
             <div class="bg-zinc-900 p-6 rounded-2xl border border-zinc-800">
                 <div class="text-xs text-zinc-500">已连接交易所</div>
-                <div class="text-5xl font-bold text-white mt-2">{len(self.exchanges)}</div>
+                <div class="text-5xl font-bold text-white mt-2" id="exchanges-count">0</div>
             </div>
             <div class="bg-zinc-900 p-6 rounded-2xl border border-zinc-800">
                 <div class="text-xs text-zinc-500">监控交易对</div>
-                <div class="text-5xl font-bold text-white mt-2">{len(self.target_symbols)}</div>
+                <div class="text-5xl font-bold text-white mt-2" id="symbols-count">0</div>
             </div>
             <div class="bg-zinc-900 p-6 rounded-2xl border border-zinc-800">
                 <div class="text-xs text-zinc-500">累计发现机会</div>
-                <div class="text-5xl font-bold text-emerald-400 mt-2">{self.opp_count}</div>
+                <div class="text-5xl font-bold text-emerald-400 mt-2" id="opp-count">0</div>
             </div>
             <div class="bg-zinc-900 p-6 rounded-2xl border border-zinc-800">
                 <div class="text-xs text-zinc-500">面板端口</div>
@@ -293,7 +354,10 @@ class GlobalArbitrageMonitor:
         <div class="bg-zinc-900 rounded-3xl overflow-hidden border border-zinc-800">
             <div class="bg-zinc-800 px-8 py-5 flex justify-between items-center">
                 <h2 class="text-2xl font-semibold">💰 最新套利机会</h2>
-                <div class="text-xs bg-zinc-700 px-4 py-1.5 rounded-full">最新30条</div>
+                <div class="flex items-center gap-3">
+                    <span class="text-xs bg-zinc-700 px-4 py-1.5 rounded-full">实时推送</span>
+                    <span class="text-xs bg-emerald-900 text-emerald-300 px-3 py-1 rounded-full" id="new-badge" style="display:none">新!</span>
+                </div>
             </div>
             <table class="w-full text-sm">
                 <thead>
@@ -308,17 +372,146 @@ class GlobalArbitrageMonitor:
                         <th class="px-6 py-5 text-left font-normal">可卖出 (USDT)</th>
                     </tr>
                 </thead>
-                <tbody class="divide-y divide-zinc-800">
-                    {rows}
+                <tbody class="divide-y divide-zinc-800" id="opportunities-tbody">
                 </tbody>
             </table>
-            {'' if self.recent_opportunities else '<div class="text-center py-20 text-zinc-500">暂无机会，耐心等待...</div>'}
+            <div id="empty-msg" class="text-center py-20 text-zinc-500">暂无机会，耐心等待...</div>
         </div>
     
         <div class="text-center text-xs text-zinc-600 mt-8">
             跨所套利机器人 • 高雄本地运行 • 按 Ctrl+C 停止
         </div>
     </div>
+
+    <script>
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(wsProtocol + '//' + window.location.host + '/ws');
+        let opportunities = [];
+        
+        // 格式化利润颜色
+        function getProfitColor(profit) {
+            if (profit >= 2) return 'text-green-400';
+            if (profit >= 1) return 'text-yellow-400';
+            return 'text-orange-400';
+        }
+        
+        // 渲染表格行
+        function renderRow(opp, isNew = false) {
+            const profitColor = getProfitColor(opp.net_profit);
+            const highlight = isNew ? 'highlight' : '';
+            return `<tr class="border-b border-gray-700 hover:bg-gray-750 ${highlight}">
+                <td class="px-6 py-4 text-sm text-gray-400">${opp.time}</td>
+                <td class="px-6 py-4 font-medium text-white">${opp.symbol}</td>
+                <td class="px-6 py-4">
+                    <span class="px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-900 text-green-300">${opp.buy_ex}</span>
+                    <span class="mx-2 text-gray-500">→</span>
+                    <span class="px-2.5 py-0.5 rounded-full text-xs font-medium bg-red-900 text-red-300">${opp.sell_ex}</span>
+                </td>
+                <td class="px-6 py-4 text-right font-mono ${profitColor} font-bold">${opp.net_profit}%</td>
+                <td class="px-6 py-4 text-right text-white">${opp.buy_price}</td>
+                <td class="px-6 py-4 text-sm text-gray-300">${opp.buy_vol}</td>
+                <td class="px-6 py-4 text-right text-white">${opp.sell_price}</td>
+                <td class="px-6 py-4 text-sm text-gray-300">${opp.sell_vol}</td>
+            </tr>`;
+        }
+        
+        // 渲染表格
+        function renderTable() {
+            const tbody = document.getElementById('opportunities-tbody');
+            const emptyMsg = document.getElementById('empty-msg');
+            
+            if (opportunities.length === 0) {
+                tbody.innerHTML = '';
+                emptyMsg.style.display = 'block';
+                return;
+            }
+            
+            emptyMsg.style.display = 'none';
+            tbody.innerHTML = opportunities.map(opp => renderRow(opp)).join('');
+        }
+        
+        // 更新统计
+        function updateStats(data) {
+            document.getElementById('exchanges-count').textContent = data.exchanges || 0;
+            document.getElementById('symbols-count').textContent = data.symbols || 0;
+            document.getElementById('opp-count').textContent = data.opp_count || 0;
+        }
+        
+        // 更新连接状态
+        function setConnected(connected) {
+            const status = document.getElementById('ws-status');
+            const text = document.getElementById('ws-text');
+            if (connected) {
+                status.className = 'w-2 h-2 rounded-full bg-green-400';
+                text.textContent = '已连接';
+            } else {
+                status.className = 'w-2 h-2 rounded-full bg-red-400';
+                text.textContent = '断开连接';
+            }
+        }
+        
+        // 显示新机会提醒
+        function showNewBadge() {
+            const badge = document.getElementById('new-badge');
+            badge.style.display = 'inline';
+            setTimeout(() => { badge.style.display = 'none'; }, 3000);
+        }
+        
+        // 更新最后时间
+        function updateTime() {
+            const now = new Date();
+            document.getElementById('update-time').textContent = now.toLocaleString('zh-CN');
+        }
+        
+        // WebSocket 消息处理
+        ws.onopen = () => {
+            setConnected(true);
+            // 获取初始数据
+            fetch('/api/opportunities').then(r => r.json()).then(data => {
+                opportunities = data;
+                renderTable();
+                updateTime();
+            });
+            fetch('/api/stats').then(r => r.json()).then(updateStats);
+        };
+        
+        ws.onmessage = (event) => {
+            const msg = JSON.parse(event.data);
+            
+            if (msg.type === 'init') {
+                updateStats(msg);
+            } else if (msg.type === 'new_opportunity') {
+                // 添加新机会到列表
+                opportunities.unshift(msg.data);
+                if (opportunities.length > 30) opportunities.pop();
+                renderTable();
+                showNewBadge();
+                updateTime();
+                // 更新计数器
+                const countEl = document.getElementById('opp-count');
+                countEl.textContent = parseInt(countEl.textContent) + 1;
+            } else if (msg.type === 'ping') {
+                ws.send('pong');
+            }
+        };
+        
+        ws.onclose = () => {
+            setConnected(false);
+            // 尝试重连
+            setTimeout(() => {
+                window.location.reload();
+            }, 3000);
+        };
+        
+        ws.onerror = () => {
+            setConnected(false);
+        };
+        
+        // 每30秒刷新一次统计数据（备用）
+        setInterval(() => {
+            fetch('/api/stats').then(r => r.json()).then(updateStats);
+        }, 30000);
+    </script>
 </body>
 </html>
             """
