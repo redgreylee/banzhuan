@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>⚡ Crypto Arbitrage Radar</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background-color: #0a0a0a; color: #e2e8f0; }
+        .custom-scrollbar::-webkit-scrollbar { width: 5px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #27272a; border-radius: 10px; }
+        [v-cloak] { display: none; }
+    </style>
+</head>
+<body>
+    <div id="app" v-cloak class="min-h-screen p-4 lg:p-8 font-sans">
+        <header class="max-w-7xl mx-auto mb-6 flex flex-col md:flex-row justify-between items-center bg-zinc-900/80 p-6 rounded-2xl border border-zinc-800 shadow-2xl backdrop-blur-md">
+            <div>
+                <h1 class="text-2xl font-black bg-gradient-to-r from-yellow-400 to-orange-500 bg-clip-text text-transparent">
+                    ⚡ ARBITRAGE RADAR
+                </h1>
+                <p class="text-zinc-500 text-[10px] font-mono uppercase tracking-widest">Live Monitoring Dashboard</p>
+            </div>
+
+            <div class="flex gap-8 mt-4 md:mt-0">
+                <div class="text-center">
+                    <p class="text-zinc-500 text-[10px] uppercase mb-1">运行时间</p>
+                    <p class="font-mono font-bold">{{ formatUptime(stats.uptime) }}</p>
+                </div>
+                <div class="text-center border-x border-zinc-800 px-8">
+                    <p class="text-zinc-500 text-[10px] uppercase mb-1">全局 TPS</p>
+                    <p class="font-mono font-bold text-cyan-400">{{ stats.tps }}</p>
+                </div>
+                <div class="text-center">
+                    <p class="text-zinc-500 text-[10px] uppercase mb-1">探针状态</p>
+                    <p class="font-mono font-bold text-green-400">{{ stats.online_workers }}/{{ stats.total_workers }}</p>
+                </div>
+            </div>
+        </header>
+
+        <main class="max-w-7xl mx-auto grid grid-cols-12 gap-6">
+            <section class="col-span-12 lg:col-span-8 bg-zinc-900/50 rounded-2xl border border-zinc-800 shadow-xl overflow-hidden">
+                <div class="p-4 border-b border-zinc-800 flex justify-between bg-zinc-900/80">
+                    <h2 class="text-sm font-bold text-yellow-500 flex items-center gap-2">
+                        <span class="flex h-2 w-2 rounded-full bg-yellow-500 animate-pulse"></span>
+                        实时利差机会 (>1.0%)
+                    </h2>
+                </div>
+                <div class="overflow-y-auto max-h-[650px] custom-scrollbar">
+                    <table class="w-full text-left">
+                        <thead class="sticky top-0 bg-zinc-900 text-zinc-500 text-[10px] uppercase">
+                            <tr>
+                                <th class="p-4">发现时间</th>
+                                <th class="p-4">交易对</th>
+                                <th class="p-4 text-center">利差</th>
+                                <th class="p-4">低价买入</th>
+                                <th class="p-4">高价卖出</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-zinc-800/50">
+                            <tr v-for="opp in stats.opportunities" class="hover:bg-white/5 transition-colors">
+                                <td class="p-4 font-mono text-xs text-zinc-500">{{ opp.time }}</td>
+                                <td class="p-4 font-bold text-white">{{ opp.symbol }}</td>
+                                <td class="p-4 text-center">
+                                    <span class="bg-green-500/10 text-green-400 px-2 py-0.5 rounded text-xs font-bold">+{{ opp.diff }}%</span>
+                                </td>
+                                <td class="p-4">
+                                    <span :class="getExStyle(opp.buy_ex)">{{ opp.buy_ex }}</span>
+                                    <span class="ml-2 font-mono text-sm">{{ opp.buy_price }}</span>
+                                </td>
+                                <td class="p-4">
+                                    <span :class="getExStyle(opp.sell_ex)">{{ opp.sell_ex }}</span>
+                                    <span class="ml-2 font-mono text-sm">{{ opp.sell_price }}</span>
+                                </td>
+                            </tr>
+                            <tr v-if="stats.opportunities.length === 0">
+                                <td colspan="5" class="p-20 text-center text-zinc-600 italic text-sm">扫描中，暂无利差...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <section class="col-span-12 lg:col-span-4">
+                <div class="bg-zinc-900/50 rounded-2xl border border-zinc-800 p-5 shadow-xl">
+                    <h2 class="text-xs font-bold text-zinc-500 uppercase tracking-tighter mb-4">Worker Nodes</h2>
+                    <div class="space-y-2 overflow-y-auto max-h-[600px] pr-2 custom-scrollbar">
+                        <div v-for="w in stats.workers" 
+                             class="bg-black/40 border border-zinc-800 p-3 rounded-xl flex justify-between items-center transition-opacity"
+                             :class="w.is_healthy ? 'opacity-100' : 'opacity-30'">
+                            <div class="flex items-center gap-3">
+                                <div class="h-1.5 w-1.5 rounded-full" :class="w.is_healthy ? 'bg-green-500' : 'bg-red-500'"></div>
+                                <div>
+                                    <p class="font-mono text-[11px] font-bold">{{ w.wid }}</p>
+                                    <p class="text-[9px] text-zinc-600 uppercase">{{ w.status }}</p>
+                                </div>
+                            </div>
+                            <div class="text-right">
+                                <p class="font-mono text-[10px] text-zinc-400">{{ w.latency }}ms</p>
+                                <p class="text-[9px]" :class="w.errors > 0 ? 'text-red-500' : 'text-zinc-800'">E: {{ w.errors }}</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script>
+        const { createApp, ref, onMounted } = Vue;
+
+        createApp({
+            setup() {
+                const stats = ref({
+                    tps: 0, uptime: 0, total_workers: 0, online_workers: 0,
+                    workers: [], opportunities: []
+                });
+
+                const fetchData = async () => {
+                    try {
+                        const res = await fetch('http://127.0.0.1:8080/api/stats');
+                        if (res.ok) stats.value = await res.json();
+                    } catch (e) {
+                        console.error("Connection lost");
+                    }
+                };
+
+                const formatUptime = (s) => {
+                    const h = Math.floor(s / 3600);
+                    const m = Math.floor((s % 3600) / 60);
+                    return `${h}h ${m}m ${s % 60}s`;
+                };
+
+                const getExStyle = (ex) => {
+                    const base = "px-1.5 py-0.5 rounded text-[9px] font-black uppercase ";
+                    const styles = {
+                        'Binance': 'bg-yellow-400 text-black',
+                        'OKX': 'bg-white text-black',
+                        'Gate': 'bg-red-600 text-white',
+                        'Bybit': 'bg-orange-500 text-white',
+                        'Bitget': 'bg-cyan-500 text-black'
+                    };
+                    return base + (styles[ex] || 'bg-zinc-700');
+                };
+
+                onMounted(() => {
+                    fetchData();
+                    setInterval(fetchData, 1000);
+                });
+
+                return { stats, formatUptime, getExStyle };
+            }
+        }).mount('#app');
+    </script>
+</body>
+</html>
