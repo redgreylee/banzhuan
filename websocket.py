@@ -198,8 +198,9 @@ async def fetch_symbols(client, name, url):
     except Exception as e:
         print(f"❌ {name} API 拉取失败: {e}")
         return {}
-
+# ================= 6. 修正后的主程序入口 =================
 async def main():
+    # 交易所 API 列表
     endpoints = {
         "Binance": "https://api.binance.com/api/v3/exchangeInfo",
         "OKX": "https://www.okx.com/api/v5/public/instruments?instType=SPOT",
@@ -209,41 +210,88 @@ async def main():
         "Bitmart": "https://api-cloud.bitmart.com/spot/v1/symbols"
     }
 
-    async with httpx.AsyncClient(verify=False) as client:
-        print("🔍 [1/3] 正在拉取全市场实时交易对...")
+    # 1. 尝试使用代理初始化 httpx 客户端
+    # 我们从 PROXIES 列表中取第一个作为主请求代理
+    main_proxy = PROXIES[0]
+    
+    # 注意：httpx 需要安装 [socks] 扩展才能支持 socks5 代理
+    # 如果你的代理是 http，则无需额外安装
+    limits = httpx.Limits(max_keepalive_connections=10, max_connections=20)
+    
+    async with httpx.AsyncClient(
+        proxy=main_proxy, 
+        verify=False, 
+        limits=limits,
+        timeout=15.0
+    ) as client:
+        print(f"🔍 [1/3] 正在通过代理 {main_proxy} 拉取全市场实时交易对...")
+        
+        # 并发执行所有 API 请求
         tasks = [fetch_symbols(client, name, url) for name, url in endpoints.items()]
         results = await asyncio.gather(*tasks)
+        
+        # 将结果映射回交易所名称
         ex_data = dict(zip(endpoints.keys(), results))
 
+    # 2. 计算交集：找出至少在两个交易所都存在的币种
     all_symbols = set()
-    for d in ex_data.values(): all_symbols.update(d.keys())
-    watchlist = [s for s in all_symbols if sum(1 for ex in ex_data if s in ex_data[ex]) >= 2]
-    print(f"✅ [2/3] 监控币种交集确认: {len(watchlist)} 个。")
+    for d in ex_data.values():
+        all_symbols.update(d.keys())
+    
+    # 统计每个币种出现的次数
+    watchlist = []
+    for s in all_symbols:
+        count = sum(1 for ex in ex_data if s in ex_data[ex])
+        if count >= 2:
+            watchlist.append(s)
+            
+    if not watchlist:
+        print("❌ 错误：未找到任何共同交易对。请检查网络代理是否工作，或 API 地址是否失效。")
+        return
 
-    print(f"🚀 [3/3] 启动分布式 WebSocket 连接...")
+    print(f"✅ [2/3] 监控币种确认：共 {len(watchlist)} 个交叉交易对。")
+
+    # 3. 启动分布式 WebSocket 连接
+    print(f"🚀 [3/3] 启动分布式 WebSocket 监听任务...")
     worker_tasks = []
     p_idx = 0
+    
     for ex_name, limit in SUB_LIMITS.items():
-        # 仅监控在 watchlist 里的币种
-        supported = {s: ex_data[ex_name][s] for s in watchlist if s in ex_data[ex_name]}
-        items = list(supported.items())
+        # 过滤出当前交易所支持的、且在监控列表中的币种
+        supported = {
+            s: ex_data[ex_name][s] 
+            for s in watchlist 
+            if s in ex_data[ex_name]
+        }
         
-        # 分片订阅
+        items = list(supported.items())
+        if not items:
+            continue
+            
+        # 根据 SUB_LIMITS 进行分片订阅（防止单条连接订阅过多导致封禁）
         for i in range(0, len(items), limit):
             chunk = dict(items[i : i + limit])
+            # 每个 worker 分配一个代理索引，实现代理轮询
             worker_tasks.append(ws_worker(ex_name, chunk, p_idx))
             p_idx += 1
-            await asyncio.sleep(0.15) # 启动缓冲，保护代理不被封
+            # 启动缓冲，避免瞬间并发连接过载
+            await asyncio.sleep(0.2)
 
-    # 聚合所有协程
-    await asyncio.gather(
-        banzhuan_scanner(),
-        status_report(),
-        *worker_tasks
-    )
+    # 4. 聚合所有长连接协程和扫描协程
+    print(f"📊 系统已就绪，正在进入实时监控模式...")
+    try:
+        await asyncio.gather(
+            banzhuan_scanner(),
+            status_report(),
+            *worker_tasks
+        )
+    except Exception as e:
+        print(f"🚨 系统运行异常: {e}")
 
 if __name__ == "__main__":
     try:
+        # 设置事件循环（部分 Windows 环境下可能需要）
+        # asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n🛑 用户停止，正在关闭...")
+        print("\n🛑 用户手动停止，程序正在退出...")
