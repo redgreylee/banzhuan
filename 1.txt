@@ -1,2 +1,14 @@
 $env:HTTP_PROXY = "http://127.0.0.1:7890"
 $env:HTTPS_PROXY = "http://127.0.0.1:7890"
+
+https://developers.binance.com/docs/zh-CN/derivatives/usds-margined-futures/websocket-api-general-info
+https://www.gate.com/docs/developers/websocket/zh_CN/
+https://www.okx.com/docs-v5/zh/#overview-websocket
+https://bybit-exchange.github.io/docs/zh-TW/v5/ws/connect
+https://www.bitget.com/zh-CN/api-doc/common/websocket-intro
+https://developer-pro.bitmart.com/cn/spot/#153042ed9e
+
+wss://ws.gate.io/v3/
+
+ws = create_connection("wss://ws.gate.io/v3/")
+ws.send('{"id":12312, "method":"depth.query", "params":["EOS_USDT", 5, "0.0001"]}')
