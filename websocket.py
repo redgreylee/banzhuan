@@ -12,28 +12,28 @@ from aiohttp import web
 from dataclasses import dataclass
 
 # ================= 1. 核心配置 =================
-# 请根据你本地的代理情况修改这里。如果不使用代理，后续代码需要剥离 python_socks
 PROXIES = [f"http://127.0.0.1:{port}" for port in range(7890, 7891)] 
-THRESHOLD = 0.005       # 0.5% 利差告警（BBO套利通常阈值更低）
-SCAN_INTERVAL = 0.2     # 盘口变动快，扫描频率提高到 0.2 秒
-STATUS_INTERVAL = 3     # 控制台刷新频率
-STALE_THRESHOLD = 20.0  # 连接僵死检测阈值
-WEB_PORT = 8080         # Web 看板端口
+THRESHOLD = 0.005       
+SCAN_INTERVAL = 0.2     
+STATUS_INTERVAL = 3     
+STALE_THRESHOLD = 20.0  
+WEB_PORT = 8080         
 
-# 每条 WebSocket 连接订阅的币种数量限制 (根据各交易所 API 限制调整)
 SUB_LIMITS = {
     "Binance": 50, "OKX": 50, "Bybit": 10,   
     "Gate": 50, "Bitget": 40, "Bitmart": 50
 }
 
+# 增加 bid_sz (买单量) 和 ask_sz (卖单量)
 @dataclass
 class BBO:
     bid_p: float
+    bid_sz: float
     ask_p: float
+    ask_sz: float
     ts: float
 
 # ================= 2. 状态监控 =================
-# 结构: prices_pool[symbol][exchange] = BBO对象
 prices_pool = defaultdict(dict)
 arbitrage_opportunities = deque(maxlen=100) 
 
@@ -103,39 +103,55 @@ class ExchangeHandler:
                 raw_msg = zlib.decompress(raw_msg, 16 + zlib.MAX_WBITS).decode('utf-8')
             
             data = ujson.loads(raw_msg)
-            s, bp, ap = None, None, None
+            s, bp, bq, ap, aq = None, None, None, None, None
 
             if self.name == "Binance" and 'u' in data: 
-                s, bp, ap = data['s'], data['b'], data['a']
+                s, bp, bq, ap, aq = data['s'], data['b'], data['B'], data['a'], data['A']
             elif self.name == "OKX" and 'data' in data:
                 d = data['data'][0]
-                s, bp, ap = d['instId'], d['bids'][0][0], d['asks'][0][0]
+                s, bp, bq, ap, aq = d['instId'], d['bids'][0][0], d['bids'][0][1], d['asks'][0][0], d['asks'][0][1]
             elif self.name == "Bybit" and 'data' in data:
                 d = data['data']
-                s, bp, ap = d['s'], d['b'][0][0], d['a'][0][0]
+                s = d.get('s')
+                # Bybit 增量推送时可能缺少某一边
+                if 'b' in d and len(d['b']) > 0: bp, bq = d['b'][0][0], d['b'][0][1]
+                if 'a' in d and len(d['a']) > 0: ap, aq = d['a'][0][0], d['a'][0][1]
             elif self.name == "Gate" and 'result' in data:
                 d = data['result']
                 if isinstance(d, dict) and 's' in d:
-                    s, bp, ap = d['s'], d['b'], d['a']
+                    s, bp, bq, ap, aq = d['s'], d['b'], d['B'], d['a'], d['A']
             elif self.name == "Bitget" and 'data' in data:
                 d = data['data'][0]
-                s, bp, ap = d['instId'], d['bids'][0][0], d['asks'][0][0]
+                s, bp, bq, ap, aq = d['instId'], d['bids'][0][0], d['bids'][0][1], d['asks'][0][0], d['asks'][0][1]
             elif self.name == "Bitmart" and 'data' in data:
                 items = data['data'] if isinstance(data['data'], list) else [data['data']]
                 for item in items:
                     if 'bid_px' in item and 'ask_px' in item:
-                        self._update_pool(item['symbol'], item['bid_px'], item['ask_px'])
+                        self._update_pool(item['symbol'], item['bid_px'], item['bid_sz'], item['ask_px'], item['ask_sz'])
                 return
 
-            if s and bp and ap: 
-                self._update_pool(s, bp, ap)
+            if s: 
+                self._update_pool(s, bp, bq, ap, aq)
         except Exception: 
             pass
 
-    def _update_pool(self, ex_s, bp, ap):
+    def _update_pool(self, ex_s, bp, bq, ap, aq):
         norm = self.rev_map.get(ex_s)
         if norm:
-            prices_pool[norm][self.name] = BBO(bid_p=float(bp), ask_p=float(ap), ts=time.time())
+            existing = prices_pool[norm].get(self.name)
+            
+            # 处理增量推送（某一边为 None 时，沿用旧数据）
+            if existing:
+                n_bp = float(bp) if bp is not None else existing.bid_p
+                n_bq = float(bq) if bq is not None else existing.bid_sz
+                n_ap = float(ap) if ap is not None else existing.ask_p
+                n_aq = float(aq) if aq is not None else existing.ask_sz
+            else:
+                # 第一次必须有完整的买卖盘
+                if bp is None or ap is None: return 
+                n_bp, n_bq, n_ap, n_aq = float(bp), float(bq), float(ap), float(aq)
+                
+            prices_pool[norm][self.name] = BBO(bid_p=n_bp, bid_sz=n_bq, ask_p=n_ap, ask_sz=n_aq, ts=time.time())
 
 # ================= 5. 工作协程 =================
 async def ws_worker(ex_name, sym_map, p_idx):
@@ -186,30 +202,29 @@ async def ws_worker(ex_name, sym_map, p_idx):
             conn_tracker.update(wid, status="LOST", errors=conn_tracker.conns.get(wid, {}).get('errors', 0) + 1, ex=err_msg)
             await asyncio.sleep(3 + (p_idx % 5))
 
-# ================= 6. 核心扫描器 (带内存数据过期清理) =================
+# ================= 6. 核心扫描器 =================
 async def banzhuan_scanner():
     while True:
         await asyncio.sleep(SCAN_INTERVAL)
         now = time.time()
         for sym, ex_dict in list(prices_pool.items()):
-            # 过滤掉超过 3 秒没有更新的脏数据
             valid_exs = {ex: bbo for ex, bbo in ex_dict.items() if now - bbo.ts < 3.0}
             if len(valid_exs) < 2: continue
             
             try:
-                # 寻找：最低卖价 (买入机会) 和 最高买价 (卖出机会)
                 best_buy_ex = min(valid_exs.keys(), key=lambda x: valid_exs[x].ask_p)
                 best_sell_ex = max(valid_exs.keys(), key=lambda x: valid_exs[x].bid_p)
                 
                 low_ask = valid_exs[best_buy_ex].ask_p
+                low_ask_qty = valid_exs[best_buy_ex].ask_sz  # 吃对方的卖单量
+                
                 high_bid = valid_exs[best_sell_ex].bid_p
+                high_bid_qty = valid_exs[best_sell_ex].bid_sz # 砸对方的买单量
                 
                 if low_ask <= 0: continue 
                     
                 diff = (high_bid - low_ask) / low_ask
                 if diff >= THRESHOLD and best_buy_ex != best_sell_ex:
-                    # 控制台简易告警
-                    print(f"💰 [机会] {sym: <10} | 利差 {diff:.2%} | 买:{best_buy_ex}({low_ask}) -> 卖:{best_sell_ex}({high_bid})")
                     
                     arbitrage_opportunities.appendleft({
                         "time": time.strftime("%H:%M:%S"),
@@ -217,8 +232,10 @@ async def banzhuan_scanner():
                         "diff": round(diff * 100, 3),
                         "buy_ex": best_buy_ex,
                         "buy_price": low_ask,
+                        "buy_qty": low_ask_qty,
                         "sell_ex": best_sell_ex,
-                        "sell_price": high_bid
+                        "sell_price": high_bid,
+                        "sell_qty": high_bid_qty
                     })
             except Exception:
                 continue
@@ -292,6 +309,7 @@ async def web_index(request):
             .scrollable-table { max-height: 75vh; overflow-y: auto; }
             .pulse { animation: pulse 2s infinite; }
             @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
+            .qty-text { font-size: 0.85em; color: #a0a0a0; }
         </style>
     </head>
     <body>
@@ -383,12 +401,21 @@ async def web_index(request):
                         oppHtml = '<tr><td colspan="5" class="text-center text-muted py-4">雷达扫描中，暂未发现高于阈值的利差...</td></tr>';
                     } else {
                         data.opportunities.forEach(opp => {
+                            // 增加数量显示字段
                             oppHtml += `<tr>
                                 <td class="text-muted">${opp.time}</td>
                                 <td class="fw-bold fs-5">${opp.symbol}</td>
                                 <td class="text-yellow fw-bold">+${opp.diff}%</td>
-                                <td><span class="badge badge-ex ${getExColor(opp.buy_ex)}">${opp.buy_ex}</span> <span class="text-green">${opp.buy_price}</span></td>
-                                <td><span class="badge badge-ex ${getExColor(opp.sell_ex)}">${opp.sell_ex}</span> <span class="text-red">${opp.sell_price}</span></td>
+                                <td>
+                                    <span class="badge badge-ex ${getExColor(opp.buy_ex)}">${opp.buy_ex}</span> 
+                                    <span class="text-green">${opp.buy_price}</span> 
+                                    <span class="qty-text">/ 数量: ${opp.buy_qty}</span>
+                                </td>
+                                <td>
+                                    <span class="badge badge-ex ${getExColor(opp.sell_ex)}">${opp.sell_ex}</span> 
+                                    <span class="text-red">${opp.sell_price}</span> 
+                                    <span class="qty-text">/ 数量: ${opp.sell_qty}</span>
+                                </td>
                             </tr>`;
                         });
                     }
@@ -462,7 +489,6 @@ async def main():
 
     all_symbols = set()
     for d in ex_data.values(): all_symbols.update(d.keys())
-    # 至少在两个交易所有挂单的才监控
     watchlist = [s for s in all_symbols if sum(1 for ex in ex_data if s in ex_data[ex]) >= 2]
     
     tasks = [start_web_server(), banzhuan_scanner(), status_report()]
