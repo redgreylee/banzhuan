@@ -9,21 +9,31 @@ from collections import defaultdict, deque
 import websockets
 from python_socks.async_.asyncio import Proxy
 from aiohttp import web
+from dataclasses import dataclass
 
 # ================= 1. 核心配置 =================
-PROXIES =[f"http://127.0.0.1:{port}" for port in range(7891, 7911)]
-THRESHOLD = 0.01        # 1% 告警
-SCAN_INTERVAL = 0.5     # 扫描频率
+# 请根据你本地的代理情况修改这里。如果不使用代理，后续代码需要剥离 python_socks
+PROXIES = [f"http://127.0.0.1:{port}" for port in range(7890, 7891)] 
+THRESHOLD = 0.005       # 0.5% 利差告警（BBO套利通常阈值更低）
+SCAN_INTERVAL = 0.2     # 盘口变动快，扫描频率提高到 0.2 秒
 STATUS_INTERVAL = 3     # 控制台刷新频率
-STALE_THRESHOLD = 25.0  # 僵尸链接检测阈值
-WEB_PORT = 8080         # Web 面板端口
+STALE_THRESHOLD = 20.0  # 连接僵死检测阈值
+WEB_PORT = 8080         # Web 看板端口
 
+# 每条 WebSocket 连接订阅的币种数量限制 (根据各交易所 API 限制调整)
 SUB_LIMITS = {
     "Binance": 50, "OKX": 50, "Bybit": 10,   
     "Gate": 50, "Bitget": 40, "Bitmart": 50
 }
 
+@dataclass
+class BBO:
+    bid_p: float
+    ask_p: float
+    ts: float
+
 # ================= 2. 状态监控 =================
+# 结构: prices_pool[symbol][exchange] = BBO对象
 prices_pool = defaultdict(dict)
 arbitrage_opportunities = deque(maxlen=100) 
 
@@ -58,7 +68,7 @@ async def create_proxy_ws(uri, proxy_url):
         ssl_context.verify_mode = ssl.CERT_NONE
         return await websockets.connect(uri, sock=sock, ssl=ssl_context, ping_interval=None)
     except Exception as e:
-        raise ConnectionError(f"Proxy Connect Error")
+        raise ConnectionError(f"Proxy Connect Error: {e}")
 
 # ================= 4. 协议处理器 =================
 class ExchangeHandler:
@@ -77,11 +87,11 @@ class ExchangeHandler:
 
     def get_sub_payload(self):
         syms = list(self.symbol_map.values())
-        if self.name == "Binance": return {"method": "SUBSCRIBE", "params":[f"{s.lower()}@ticker" for s in syms], "id": 1}
-        if self.name == "OKX": return {"op": "subscribe", "args":[{"channel": "tickers", "instId": s} for s in syms]}
-        if self.name == "Bybit": return {"op": "subscribe", "args":[f"tickers.{s}" for s in syms]}
-        if self.name == "Gate": return {"time": int(time.time()), "channel": "spot.tickers", "event": "subscribe", "payload": syms}
-        if self.name == "Bitget": return {"op": "subscribe", "args":[{"instType": "SPOT", "channel": "ticker", "instId": s} for s in syms]}
+        if self.name == "Binance": return {"method": "SUBSCRIBE", "params":[f"{s.lower()}@bookTicker" for s in syms], "id": 1}
+        if self.name == "OKX": return {"op": "subscribe", "args":[{"channel": "bbo-tbt", "instId": s} for s in syms]}
+        if self.name == "Bybit": return {"op": "subscribe", "args":[f"orderbook.1.{s}" for s in syms]}
+        if self.name == "Gate": return {"channel": "spot.book_ticker", "event": "subscribe", "payload": syms}
+        if self.name == "Bitget": return {"op": "subscribe", "args":[{"instType": "SPOT", "channel": "books1", "instId": s} for s in syms]}
         if self.name == "Bitmart": return {"op": "subscribe", "args":[f"spot/ticker:{s}" for s in syms]}
         return {}
 
@@ -91,27 +101,41 @@ class ExchangeHandler:
         try:
             if self.name == "Bitmart" and isinstance(raw_msg, bytes):
                 raw_msg = zlib.decompress(raw_msg, 16 + zlib.MAX_WBITS).decode('utf-8')
-            data = ujson.loads(raw_msg)
-            s, p = None, None
             
-            if self.name == "Binance" and 's' in data: s, p = data['s'], data['c']
-            elif self.name == "OKX" and 'data' in data: s, p = data['data'][0]['instId'], data['data'][0]['last']
-            elif self.name == "Bybit" and 'data' in data: 
+            data = ujson.loads(raw_msg)
+            s, bp, ap = None, None, None
+
+            if self.name == "Binance" and 'u' in data: 
+                s, bp, ap = data['s'], data['b'], data['a']
+            elif self.name == "OKX" and 'data' in data:
+                d = data['data'][0]
+                s, bp, ap = d['instId'], d['bids'][0][0], d['asks'][0][0]
+            elif self.name == "Bybit" and 'data' in data:
                 d = data['data']
-                if 'symbol' in d and 'lastPrice' in d: s, p = d['symbol'], d['lastPrice']
-            elif self.name == "Gate" and 'result' in data: 
-                if isinstance(data['result'], dict) and 'currency_pair' in data['result']: s, p = data['result']['currency_pair'], data['result']['last']
-            elif self.name == "Bitget" and 'data' in data: s, p = data['data'][0]['instId'], data['data'][0]['lastPr']
+                s, bp, ap = d['s'], d['b'][0][0], d['a'][0][0]
+            elif self.name == "Gate" and 'result' in data:
+                d = data['result']
+                if isinstance(d, dict) and 's' in d:
+                    s, bp, ap = d['s'], d['b'], d['a']
+            elif self.name == "Bitget" and 'data' in data:
+                d = data['data'][0]
+                s, bp, ap = d['instId'], d['bids'][0][0], d['asks'][0][0]
             elif self.name == "Bitmart" and 'data' in data:
                 items = data['data'] if isinstance(data['data'], list) else [data['data']]
-                for item in items: self._update_pool(item['symbol'], item['last_price'])
+                for item in items:
+                    if 'bid_px' in item and 'ask_px' in item:
+                        self._update_pool(item['symbol'], item['bid_px'], item['ask_px'])
                 return
-            if s and p: self._update_pool(s, p)
-        except Exception: pass
 
-    def _update_pool(self, ex_s, p):
+            if s and bp and ap: 
+                self._update_pool(s, bp, ap)
+        except Exception: 
+            pass
+
+    def _update_pool(self, ex_s, bp, ap):
         norm = self.rev_map.get(ex_s)
-        if norm: prices_pool[norm][self.name] = (float(p), time.time())
+        if norm:
+            prices_pool[norm][self.name] = BBO(bid_p=float(bp), ask_p=float(ap), ts=time.time())
 
 # ================= 5. 工作协程 =================
 async def ws_worker(ex_name, sym_map, p_idx):
@@ -155,7 +179,6 @@ async def ws_worker(ex_name, sym_map, p_idx):
                             raise ConnectionError("Stream Stalled")
                 
                 finally:
-                    # 确保无论任何异常退出，活动连接数都能正确减少
                     stats.active_conns = max(0, stats.active_conns - 1)
 
         except Exception as e:
@@ -163,32 +186,44 @@ async def ws_worker(ex_name, sym_map, p_idx):
             conn_tracker.update(wid, status="LOST", errors=conn_tracker.conns.get(wid, {}).get('errors', 0) + 1, ex=err_msg)
             await asyncio.sleep(3 + (p_idx % 5))
 
-# ================= 6. 扫描与控制台报告 =================
+# ================= 6. 核心扫描器 (带内存数据过期清理) =================
 async def banzhuan_scanner():
     while True:
         await asyncio.sleep(SCAN_INTERVAL)
         now = time.time()
         for sym, ex_dict in list(prices_pool.items()):
-            valid = {ex: p for ex, (p, ts) in ex_dict.items() if now - ts < 3.0}
-            if len(valid) < 2: continue
+            # 过滤掉超过 3 秒没有更新的脏数据
+            valid_exs = {ex: bbo for ex, bbo in ex_dict.items() if now - bbo.ts < 3.0}
+            if len(valid_exs) < 2: continue
             
-            sorted_v = sorted(valid.items(), key=lambda x: x[1])
-            (l_ex, lp), (h_ex, hp) = sorted_v[0], sorted_v[-1]
-            if lp <= 0: continue 
+            try:
+                # 寻找：最低卖价 (买入机会) 和 最高买价 (卖出机会)
+                best_buy_ex = min(valid_exs.keys(), key=lambda x: valid_exs[x].ask_p)
+                best_sell_ex = max(valid_exs.keys(), key=lambda x: valid_exs[x].bid_p)
                 
-            diff = (hp - lp) / lp
-            if diff >= THRESHOLD:
-                print(f"🔥 [利差] {sym: <10} | {diff:.2%} | 买:{l_ex}({lp}) -> 卖:{h_ex}({hp})")
-                arbitrage_opportunities.appendleft({
-                    "time": time.strftime("%H:%M:%S"),
-                    "symbol": sym,
-                    "diff": round(diff * 100, 2),
-                    "buy_ex": l_ex,
-                    "buy_price": lp,
-                    "sell_ex": h_ex,
-                    "sell_price": hp
-                })
+                low_ask = valid_exs[best_buy_ex].ask_p
+                high_bid = valid_exs[best_sell_ex].bid_p
+                
+                if low_ask <= 0: continue 
+                    
+                diff = (high_bid - low_ask) / low_ask
+                if diff >= THRESHOLD and best_buy_ex != best_sell_ex:
+                    # 控制台简易告警
+                    print(f"💰 [机会] {sym: <10} | 利差 {diff:.2%} | 买:{best_buy_ex}({low_ask}) -> 卖:{best_sell_ex}({high_bid})")
+                    
+                    arbitrage_opportunities.appendleft({
+                        "time": time.strftime("%H:%M:%S"),
+                        "symbol": sym,
+                        "diff": round(diff * 100, 3),
+                        "buy_ex": best_buy_ex,
+                        "buy_price": low_ask,
+                        "sell_ex": best_sell_ex,
+                        "sell_price": high_bid
+                    })
+            except Exception:
+                continue
 
+# ================= 7. 控制台报告 =================
 async def status_report():
     while True:
         await asyncio.sleep(STATUS_INTERVAL)
@@ -197,11 +232,11 @@ async def status_report():
         elapsed = now - stats.start_time
         tps = stats.msg_count / elapsed if elapsed > 0 else 0
         
-        print(f"═══ 📊 搬砖监控 (代理: {len(PROXIES)}端口) Web 面板: http://127.0.0.1:{WEB_PORT} ═══ TPS: {tps:.1f}")
+        print(f"═══ 📊 现货 BBO 监控 (代理: {len(PROXIES)}端口) Web 面板: http://127.0.0.1:{WEB_PORT} ═══ TPS: {tps:.1f}")
         print(f"{'WorkerID':<12} | {'Stat':<6} | {'Lat':<7} | {'LastIn':<7} | {'Err'}")
         print("-" * 55)
         
-        display_list =[]
+        display_list = []
         for wid, info in conn_tracker.conns.items():
             last_in = now - info['last_msg']
             is_healthy = (info['status'] == "ONLINE" and last_in < 4.0)
@@ -214,13 +249,13 @@ async def status_report():
             print(f"{wid:<12} | {mark} {info['status']:<4} | {info['latency']:>4.0f}ms | {last_in:>5.1f}s | {err_show}")
         print("-" * 55)
 
-# ================= 7. Web 面板模块 =================
+# ================= 8. Web 面板模块 =================
 async def web_api_data(request):
     now = time.time()
     elapsed = now - stats.start_time
     tps = stats.msg_count / elapsed if elapsed > 0 else 0
     
-    workers =[]
+    workers = []
     for wid, info in conn_tracker.conns.items():
         last_in = now - info['last_msg']
         is_healthy = (info['status'] == "ONLINE" and last_in < 4.0)
@@ -262,7 +297,7 @@ async def web_index(request):
     <body>
         <div class="container-fluid py-4">
             <div class="d-flex justify-content-between align-items-center mb-4">
-                <h3 class="mb-0 text-white">⚡ 跨所高频监控大盘</h3>
+                <h3 class="mb-0 text-white">⚡ BBO 盘口高频套利雷达</h3>
                 <div class="d-flex gap-4">
                     <div class="text-center"><div class="text-muted small">系统运行</div><strong class="fs-5" id="uptime">0s</strong></div>
                     <div class="text-center"><div class="text-muted small">实时 TPS</div><strong class="fs-5 text-info" id="tps">0</strong></div>
@@ -274,15 +309,15 @@ async def web_index(request):
                 <div class="col-lg-8">
                     <div class="card shadow-sm h-100">
                         <div class="card-header border-0 bg-transparent pt-3 pb-0">
-                            <h5 class="text-yellow mb-0">🔥 实时套利机会 (>1%)</h5>
+                            <h5 class="text-yellow mb-0">🔥 实时盘口机会 (高于阈值)</h5>
                         </div>
                         <div class="card-body">
                             <div class="table-responsive scrollable-table">
                                 <table class="table table-dark table-hover align-middle">
                                     <thead class="sticky-top bg-dark">
                                         <tr>
-                                            <th>发现时间</th><th>交易对</th><th>利差空间</th>
-                                            <th>买入平台 (低价)</th><th>卖出平台 (高价)</th>
+                                            <th>发现时间</th><th>交易对</th><th>瞬时利差</th>
+                                            <th>买入平台 (吃卖单)</th><th>卖出平台 (砸买单)</th>
                                         </tr>
                                     </thead>
                                     <tbody id="opp-tbody">
@@ -345,7 +380,7 @@ async def web_index(request):
 
                     let oppHtml = '';
                     if (data.opportunities.length === 0) {
-                        oppHtml = '<tr><td colspan="5" class="text-center text-muted py-4">雷达扫描中，暂未发现 >1% 的利差...</td></tr>';
+                        oppHtml = '<tr><td colspan="5" class="text-center text-muted py-4">雷达扫描中，暂未发现高于阈值的利差...</td></tr>';
                     } else {
                         data.opportunities.forEach(opp => {
                             oppHtml += `<tr>
@@ -381,7 +416,7 @@ async def start_web_server():
     await site.start()
     print(f"🚀 Web 看板已启动: http://127.0.0.1:{WEB_PORT}")
 
-# ================= 8. 入口逻辑 =================
+# ================= 9. 入口逻辑 =================
 async def fetch_symbols(client, name, url):
     try:
         resp = await client.get(url, timeout=15)
@@ -420,15 +455,17 @@ async def main():
         "Bitmart": "https://api-cloud.bitmart.com/spot/v1/symbols"
     }
 
+    print("🔍 正在通过 HTTP 同步全交易所交易对...")
     async with httpx.AsyncClient(proxy=PROXIES[0], verify=False) as client:
         results = await asyncio.gather(*[fetch_symbols(client, n, u) for n, u in endpoints.items()])
         ex_data = dict(zip(endpoints.keys(), results))
 
     all_symbols = set()
     for d in ex_data.values(): all_symbols.update(d.keys())
-    watchlist =[s for s in all_symbols if sum(1 for ex in ex_data if s in ex_data[ex]) >= 2]
+    # 至少在两个交易所有挂单的才监控
+    watchlist = [s for s in all_symbols if sum(1 for ex in ex_data if s in ex_data[ex]) >= 2]
     
-    tasks =[start_web_server(), banzhuan_scanner(), status_report()]
+    tasks = [start_web_server(), banzhuan_scanner(), status_report()]
     p_global_idx = 0
     for ex_name, limit in SUB_LIMITS.items():
         supported = {s: ex_data[ex_name][s] for s in watchlist if s in ex_data[ex_name]}
@@ -437,12 +474,13 @@ async def main():
             tasks.append(ws_worker(ex_name, dict(items[i : i + limit]), p_global_idx))
             p_global_idx += 1
     
-    print(f"初始化完成！共分配 {p_global_idx} 个 Worker，开始连接...")
+    print(f"✅ 初始化完成！监控共同币种: {len(watchlist)} 个，启动 WebSocket 探针: {p_global_idx} 个")
     await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
+    if os.name == 'nt': 
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     try:
-        if os.name == 'nt': asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("程序已手动停止。")
+        print("\n程序已手动停止。")
