@@ -12,7 +12,7 @@ from aiohttp import web
 from dataclasses import dataclass
 
 # ================= 1. 核心配置 =================
-PROXIES = [f"http://127.0.0.1:{port}" for port in range(7890, 7891)] 
+PROXIES = [f"http://127.0.0.1:{port}" for port in range(7894, 7910)] 
 THRESHOLD = 0.005       
 SCAN_INTERVAL = 0.2     
 STATUS_INTERVAL = 3     
@@ -20,8 +20,8 @@ STALE_THRESHOLD = 20.0
 WEB_PORT = 8080         
 
 SUB_LIMITS = {
-    "Binance": 50, "OKX": 50, "Bybit": 10,   
-    "Gate": 50, "Bitget": 40, "Bitmart": 50
+    "Binance": 100, "OKX": 100, "Bybit": 10,   
+    "Gate": 100, "Bitget": 100, "Bitmart": 50
 }
 
 # 增加 bid_sz (买单量) 和 ask_sz (卖单量)
