@@ -11,19 +11,19 @@ from python_socks.async_.asyncio import Proxy
 from aiohttp import web
 
 # ================= 1. 核心配置 =================
-PROXIES = [f"http://127.0.0.1:{port}" for port in range(7894, 7910)] 
+PROXIES = [f"http://127.0.0.1:{port}" for port in range(7894, 7909)] 
 WEB_PORT = 8080         
 
 # --- 交易策略限制 ---
-MIN_NET_PROFIT = 0.01  # 最小净利润要求 (1%)
+MIN_NET_PROFIT = 0.008  # 最小净利润要求 (1%)
 EXCHANGE_FEE = 0.001    # 预估单边手续费 (0.1%)
-MIN_DEPTH_USD = 100.0   # 最小买卖盘深度限制 (单位: USDT)
+MIN_DEPTH_USD = 50.0   # 最小买卖盘深度限制 (单位: USDT)
 MAX_ABNORMAL_DIFF = 0.05 # 异常值过滤 (利差超过 5% 视为异常数据，不记录)
 
 # 每个 WS 连接订阅的交易对上限
 SUB_LIMITS = {
     "Binance": 100, "OKX": 100, "Bybit": 10,   
-    "Gate": 100, "Bitget": 100, "Bitmart": 50
+    "Gate": 100, "Bitget": 50, "Bitmart": 30
 }
 
 # ================= 2. 全局状态存储 =================
@@ -304,8 +304,8 @@ async def web_index(request):
                         <td>${o.time}</td>
                         <td><strong class="copy-symbol" onclick="copyToClipboard('${cleanSym}')" title="点击复制">${cleanSym}</strong></td>
                         <td class="profit-high">+${o.net_profit}%</td>
-                        <td><span class="badge bg-success">${o.buy_ex}</span> ${o.buy_price}<br><span class="qty-text">$${o.buy_val}</span></td>
-                        <td><span class="badge bg-danger">${o.sell_ex}</span> ${o.sell_price}<br><span class="qty-text">$${o.sell_val}</span></td>
+                        <td><span class="badge bg-danger">${o.buy_ex}</span> ${o.buy_price}<br><span class="qty-text">$${o.buy_val}</span></td>
+                        <td><span class="badge bg-success">${o.sell_ex}</span> ${o.sell_price}<br><span class="qty-text">$${o.sell_val}</span></td>
                     </tr>`;
                 }).join('');
             } catch(e) {}
